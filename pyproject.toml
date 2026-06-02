@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keytalk"
+version = "0.1.0"
+description = "Keyboard-safe prompt and response transport for host-to-host LLM relays."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "GitHub Copilot" }]
+
+[project.scripts]
+keytalk = "keytalk.cli:run_cli"
+
+[tool.setuptools]
+packages = ["keytalk"]
