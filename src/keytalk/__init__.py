@@ -25,6 +25,11 @@ from .backends import (
 )
 from .consumer import ConsumerClient, RemoteError
 from .host import HostService
+from .server import (
+    OllamaBridgeServer,
+    PromptStreamer,
+    build_prompt_from_messages,
+)
 from .protocol import (
     CompleteMessage,
     Flags,
@@ -67,4 +72,8 @@ __all__ = [
     "HostService",
     "ConsumerClient",
     "RemoteError",
+    # ollama-compatible HTTP bridge
+    "OllamaBridgeServer",
+    "PromptStreamer",
+    "build_prompt_from_messages",
 ]

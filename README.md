@@ -38,6 +38,7 @@ boundary markers so messages survive fragmentation, interleaving, and streaming.
 | `keytalk.host` | `HostService`: prompt frames -> LLM -> streamed response frames. |
 | `keytalk.consumer` | `ConsumerClient`: prompt -> frames -> reassembled/streamed reply. |
 | `keytalk.ble` | Real radio adapters: `bless` peripheral (host), `bleak` central (consumer). |
+| `keytalk.server` | Ollama-compatible HTTP bridge exposed by `keytalk consume --serve`. |
 | `keytalk.cli` | `keytalk host` / `keytalk consume` / `keytalk scan` commands. |
 
 The radio layer is the **only** part that needs Bluetooth. Everything else is
@@ -71,6 +72,26 @@ On the **consumer**:
 keytalk scan                                   # find the host's address
 keytalk consume --address <ADDRESS> --prompt "Explain BLE GATT in one line."
 ```
+
+### Ollama-compatible endpoint (`--serve`)
+
+Many tools (editors, IDE extensions, chat front-ends) already speak the
+[Ollama](https://ollama.com) HTTP API. `keytalk consume --serve` runs a local,
+dependency-free Ollama-compatible HTTP server on the consumer machine and bridges
+every request to the LLM running on the remote BLE host — so a tool such as
+VS Code only needs to point at this port instead of a real Ollama install:
+
+```bash
+keytalk consume --address <ADDRESS> --serve            # binds 127.0.0.1:11434
+keytalk consume --address <ADDRESS> --serve --port 11434 --model llama3
+```
+
+It implements the endpoints clients probe and use: `GET /` (health),
+`GET /api/version`, `GET /api/tags`, `POST /api/show`, `POST /api/generate`, and
+`POST /api/chat` — with both streaming (newline-delimited JSON) and
+non-streaming (`"stream": false`) responses. Point your Ollama client at
+`http://127.0.0.1:11434` (or whatever `--host`/`--port` you chose) and it will
+transparently talk to the model over Bluetooth LE.
 
 ### Library API
 
@@ -118,4 +139,8 @@ error cases), the streaming encoder, the loopback transport, the backends and
 Ollama line parsing, and full host<->consumer integration including large
 payloads, Unicode split across frames, empty prompts/responses, incremental
 streaming, backend errors surfacing as `RemoteError`, concurrent requests, id
-reuse, and timeouts.
+reuse, and timeouts.  A dedicated suite also drives the Ollama-compatible
+`--serve` bridge over a real TCP socket — discovery endpoints, streaming and
+non-streaming `/api/generate` and `/api/chat`, chunked encoding, keep-alive,
+malformed-request handling, and the full server → consumer → BLE loopback →
+host pipeline.
