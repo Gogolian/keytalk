@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keytalk"
+version = "0.1.0"
+description = "Use an LLM on one machine from another over Bluetooth LE GATT (no IP network)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Gogolian" }]
+keywords = ["bluetooth", "ble", "gatt", "llm", "ollama", "bleak", "bless"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Communications",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Real radio adapters. The core library and the test-suite need neither.
+consumer = ["bleak>=0.21"]
+host = ["bless>=0.2.6"]
+ble = ["bleak>=0.21", "bless>=0.2.6"]
+
+[project.scripts]
+keytalk = "keytalk.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Gogolian/keytalk"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+keytalk = ["py.typed"]
