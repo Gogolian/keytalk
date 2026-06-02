@@ -3,6 +3,7 @@ import json
 import unittest
 from unittest import mock
 
+from keytalk.bridge import PromptResponse
 from keytalk import cli
 
 
@@ -47,21 +48,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
 
         with mock.patch("keytalk.cli.OllamaClient.generate") as generate:
-            generate.return_value = mock.Mock(
+            generate.return_value = PromptResponse(
                 message_id="msg123",
                 model="llama3.2",
                 response="A keyboard-safe relay.",
-                error=None,
-                to_message=lambda: mock.Mock(
-                    payload=json.dumps(
-                        {
-                            "response": "A keyboard-safe relay.",
-                            "model": "llama3.2",
-                            "error": None,
-                        },
-                        separators=(",", ":"),
-                    )
-                ),
             )
             exit_code, response_frames, stderr = self._run(["reply", *request_frames.strip().splitlines()])
 

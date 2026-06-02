@@ -14,6 +14,7 @@ from .bridge import (
     decode_prompt_request,
     decode_prompt_response,
     encode_prompt_request,
+    encode_prompt_response,
     handle_prompt_lines,
 )
 from .protocol import DEFAULT_CHUNK_SIZE, ProtocolError, decode_lines, encode_text
@@ -107,10 +108,7 @@ def _command_mock_reply(args: argparse.Namespace, stdin: TextIO, stdout: TextIO)
         response=args.response,
         model=prompt_request.model,
     )
-    return _write_lines(
-        [line for line in encode_text(response.to_message().payload, kind="response", message_id=response.message_id)],
-        stdout,
-    )
+    return _write_lines(encode_prompt_response(response), stdout)
 
 
 def build_parser() -> argparse.ArgumentParser:
