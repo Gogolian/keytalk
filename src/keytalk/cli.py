@@ -20,6 +20,7 @@ from typing import List, Optional
 from .backends import OllamaBackend
 from .consumer import ConsumerClient
 from .host import HostService
+from .server import DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_PORT, OllamaBridgeServer
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -35,11 +36,39 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     host.add_argument("--name", default="keytalk", help="advertised BLE name")
 
-    consume = sub.add_parser("consume", help="send one prompt to a BLE host")
+    consume = sub.add_parser(
+        "consume",
+        help="send one prompt to a BLE host, or serve an Ollama-compatible API",
+    )
     consume.add_argument("--address", required=True, help="host BLE address")
-    consume.add_argument("--prompt", required=True, help="prompt text to send")
+    consume.add_argument(
+        "--prompt",
+        help="prompt text to send (required unless --serve is given)",
+    )
     consume.add_argument(
         "--timeout", type=float, default=300.0, help="response timeout (s)"
+    )
+    consume.add_argument(
+        "--serve",
+        action="store_true",
+        help="run a local Ollama-compatible HTTP endpoint backed by the BLE "
+        "host (point e.g. VS Code at it instead of a real Ollama server)",
+    )
+    consume.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help="address to bind the --serve HTTP endpoint to",
+    )
+    consume.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="port for the --serve HTTP endpoint (Ollama's default is 11434)",
+    )
+    consume.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="model name advertised by the --serve endpoint",
     )
 
     scan = sub.add_parser("scan", help="discover nearby keytalk hosts")
@@ -72,12 +101,40 @@ async def _run_consume(args: argparse.Namespace) -> int:
     client = ConsumerClient(transport, timeout=args.timeout)
     await client.start()
     try:
+        if args.serve:
+            return await _serve_consume(args, client)
+        if args.prompt is None:
+            print(
+                "error: --prompt is required unless --serve is given",
+                file=sys.stderr,
+            )
+            return 2
         async for piece in client.stream(args.prompt):
             sys.stdout.write(piece)
             sys.stdout.flush()
         sys.stdout.write("\n")
     finally:
         await client.close()
+    return 0
+
+
+async def _serve_consume(
+    args: argparse.Namespace, client: ConsumerClient
+) -> int:
+    server = OllamaBridgeServer(
+        client, host=args.host, port=args.port, model=args.model
+    )
+    await server.start()
+    print(
+        f"keytalk serving Ollama-compatible API on "
+        f"http://{server.host}:{server.port} (model {server.model!r}); "
+        f"bridging to BLE host {args.address!r}. Press Ctrl-C to stop.",
+        file=sys.stderr,
+    )
+    try:
+        await server.serve_forever()
+    finally:
+        await server.close()
     return 0
 
 
