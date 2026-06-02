@@ -1,0 +1,16 @@
+LICENSE
+README.md
+pyproject.toml
+keytalk/__init__.py
+keytalk/__main__.py
+keytalk/bridge.py
+keytalk/cli.py
+keytalk/protocol.py
+keytalk.egg-info/PKG-INFO
+keytalk.egg-info/SOURCES.txt
+keytalk.egg-info/dependency_links.txt
+keytalk.egg-info/entry_points.txt
+keytalk.egg-info/top_level.txt
+tests/test_bridge.py
+tests/test_cli.py
+tests/test_protocol.py
