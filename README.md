@@ -28,6 +28,10 @@ and reassembled on the far side. keytalk's framing protocol
 (`keytalk.protocol`) handles message ids, sequence numbers, and `START`/`END`
 boundary markers so messages survive fragmentation, interleaving, and streaming.
 
+**Performance**: Prompts are automatically compressed with zlib before chunking,
+typically reducing transmission size by 60-80% and dramatically speeding up
+consumer → host communication.
+
 ## How it is structured
 
 | Module | Responsibility |

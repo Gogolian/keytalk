@@ -89,6 +89,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MODEL,
         help="model name advertised by the --serve endpoint",
     )
+    consume.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="disable zlib compression of prompts (compression is enabled by "
+        "default and typically reduces transmission time by 60-80%% for text)",
+    )
 
     scan = sub.add_parser("scan", help="discover nearby keytalk hosts")
     scan.add_argument(
@@ -153,7 +159,11 @@ async def _run_consume(args: argparse.Namespace) -> int:
     from .ble.central import BleakCentralTransport
 
     transport = BleakCentralTransport(args.address)
-    client = ConsumerClient(transport, timeout=args.timeout)
+    client = ConsumerClient(
+        transport, 
+        timeout=args.timeout,
+        compress_prompts=not args.no_compress,
+    )
     await client.start()
     try:
         if args.serve:

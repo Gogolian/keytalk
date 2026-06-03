@@ -14,10 +14,12 @@ import codecs
 import itertools
 import json
 import logging
+import zlib
 from typing import AsyncIterator, Dict, List, Optional
 
 from .protocol import (
     DEFAULT_ATT_MTU,
+    Flags,
     Frame,
     MessageType,
     ProtocolError,
@@ -163,6 +165,7 @@ class ConsumerClient:
         mtu: int = DEFAULT_ATT_MTU,
         max_payload_size: Optional[int] = None,
         timeout: float = DEFAULT_TIMEOUT,
+        compress_prompts: bool = True,
     ) -> None:
         self._transport = transport
         self._max_payload = (
@@ -173,6 +176,7 @@ class ConsumerClient:
         if self._max_payload <= 0:
             raise ValueError("max_payload_size must be positive")
         self._timeout = timeout
+        self._compress_prompts = compress_prompts
         self._pending: Dict[int, _PendingRequest] = {}
         # Final ACK value for recently-completed messages, so a retransmitted
         # tail frame (arriving after we stopped tracking the request) can still
@@ -243,18 +247,53 @@ class ConsumerClient:
     async def _send_message(
         self, message_id: int, msg_type: MessageType, payload: bytes
     ) -> None:
-        logger.info(
-            "Sending %s (msg_id=%d, %d bytes)...",
-            msg_type.name,
-            message_id,
-            len(payload),
-        )
+        # Compress prompts to reduce BLE transmission time
+        compressed = False
+        original_size = len(payload)
+        if self._compress_prompts and msg_type == MessageType.PROMPT and payload:
+            compressed_payload = zlib.compress(payload, level=6)
+            # Only use compression if it actually saves space
+            if len(compressed_payload) < len(payload):
+                payload = compressed_payload
+                compressed = True
+                logger.info(
+                    "Sending %s (msg_id=%d, %d bytes -> %d bytes compressed, %.1f%%)...",
+                    msg_type.name,
+                    message_id,
+                    original_size,
+                    len(payload),
+                    100 * len(payload) / original_size,
+                )
+            else:
+                logger.info(
+                    "Sending %s (msg_id=%d, %d bytes, compression skipped)...",
+                    msg_type.name,
+                    message_id,
+                    len(payload),
+                )
+        else:
+            logger.info(
+                "Sending %s (msg_id=%d, %d bytes)...",
+                msg_type.name,
+                message_id,
+                len(payload),
+            )
         frames = chunk_message(
             msg_type,
             message_id,
             payload,
             self._max_payload,
         )
+        # Mark first frame as compressed if we compressed the payload
+        if compressed and frames:
+            frames[0] = Frame(
+                msg_type=frames[0].msg_type,
+                message_id=frames[0].message_id,
+                seq=frames[0].seq,
+                payload=frames[0].payload,
+                flags=frames[0].flags | Flags.COMPRESSED,
+                version=frames[0].version,
+            )
         for frame in frames:
             await self._transport.send(frame.encode())
         logger.info("✓ %s sent, waiting for response...", msg_type.name)

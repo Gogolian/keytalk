@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import zlib
 from typing import Dict, Optional, Set
 
 from .backends import LLMBackend

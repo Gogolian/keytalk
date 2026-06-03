@@ -79,6 +79,7 @@ class Flags(IntFlag):
     NONE = 0
     START = 1
     END = 2
+    COMPRESSED = 4  # Payload is zlib-compressed
 
 
 class ProtocolError(Exception):
@@ -162,7 +163,7 @@ class Frame:
             raise ProtocolError(f"unknown message type: {raw_type}") from exc
         # Flags is an IntFlag; reject bits we do not understand so that a
         # corrupted byte does not silently look like a valid boundary marker.
-        known = int(Flags.START | Flags.END)
+        known = int(Flags.START | Flags.END | Flags.COMPRESSED)
         if raw_flags & ~known:
             raise ProtocolError(f"unknown flag bits set: {raw_flags:#04x}")
         return cls(
@@ -237,12 +238,13 @@ def chunk_message(
 class _Buffer:
     """Accumulates frames belonging to a single in-flight message."""
 
-    __slots__ = ("msg_type", "chunks", "next_seq")
+    __slots__ = ("msg_type", "chunks", "next_seq", "compressed")
 
-    def __init__(self, msg_type: MessageType) -> None:
+    def __init__(self, msg_type: MessageType, compressed: bool = False) -> None:
         self.msg_type = msg_type
         self.chunks: List[bytes] = []
         self.next_seq = 0
+        self.compressed = compressed
 
 
 class Reassembler:
@@ -262,7 +264,8 @@ class Reassembler:
 
         if frame.is_start:
             # A new message always resets any stale partial buffer for this id.
-            buf = _Buffer(frame.msg_type)
+            compressed = bool(frame.flags & Flags.COMPRESSED)
+            buf = _Buffer(frame.msg_type, compressed)
             self._buffers[frame.message_id] = buf
         elif buf is None:
             raise ProtocolError(
@@ -286,10 +289,20 @@ class Reassembler:
 
         if frame.is_end:
             del self._buffers[frame.message_id]
+            payload = b"".join(buf.chunks)
+            # Decompress if the START frame had the COMPRESSED flag
+            if buf.compressed:
+                import zlib
+                try:
+                    payload = zlib.decompress(payload)
+                except zlib.error as exc:
+                    raise ProtocolError(
+                        f"failed to decompress message {frame.message_id}"
+                    ) from exc
             return CompleteMessage(
                 msg_type=buf.msg_type,
                 message_id=frame.message_id,
-                payload=b"".join(buf.chunks),
+                payload=payload,
             )
         return None
 
