@@ -86,7 +86,7 @@ class BlessPeripheralTransport(Transport):
         # When the consumer writes the prompt characteristic, forward the bytes.
         def _write_request(characteristic, value, **_kwargs) -> None:
             data = bytes(value)
-            logger.info("✓ Consumer sent %d bytes", len(data))
+            logger.debug("✓ Consumer sent %d bytes", len(data))
             assert self._loop is not None
             asyncio.run_coroutine_threadsafe(self._dispatch(data), self._loop)
 

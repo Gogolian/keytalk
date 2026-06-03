@@ -54,6 +54,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "this if large agent prompts overflow the model's default context",
     )
     host.add_argument("--name", default="keytalk", help="advertised BLE name")
+    host.add_argument(
+        "--verbose",
+        action="store_true",
+        help="enable verbose logging (shows frame-by-frame details)",
+    )
 
     consume = sub.add_parser(
         "consume",
@@ -110,8 +115,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _run_host(args: argparse.Namespace) -> int:
     import logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         datefmt='%H:%M:%S'
     )

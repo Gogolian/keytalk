@@ -150,7 +150,8 @@ class HostService:
                 if not fragment:
                     continue
                 token_count += 1
-                logger.debug("Received token #%d from backend (msg_id=%d)", token_count, message_id)
+                if token_count % 10 == 0:  # Log every 10th token in verbose mode
+                    logger.debug("Received %d tokens so far (msg_id=%d)", token_count, message_id)
                 for frame in encoder.push(fragment.encode("utf-8")):
                     await sender.send_frame(frame)
             for frame in encoder.finish():
