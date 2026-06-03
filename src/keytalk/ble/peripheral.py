@@ -52,6 +52,7 @@ class BlessPeripheralTransport(Transport):
         service_uuid: str = SERVICE_UUID,
         prompt_char: str = PROMPT_CHAR_UUID,
         response_char: str = RESPONSE_CHAR_UUID,
+        notify_interval: float = 0.02,
     ) -> None:
         super().__init__()
         self._name = name
@@ -60,6 +61,12 @@ class BlessPeripheralTransport(Transport):
         self._response_char = response_char
         self._server = None  # type: ignore[assignment]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Minimum spacing between consecutive notifications. CoreBluetooth (and
+        # BlueZ) transmit notifications asynchronously; if we overwrite the
+        # characteristic value too quickly the previous notification can be
+        # dropped, which shows up on the consumer as an out-of-order frame.
+        self._notify_interval = notify_interval
+        self._send_lock = asyncio.Lock()
 
     async def start(self) -> None:
         _import_bless()
@@ -121,11 +128,19 @@ class BlessPeripheralTransport(Transport):
     async def send(self, frame: bytes) -> None:
         if self._server is None:
             raise TransportClosed("BLE peripheral is not running")
-        char = self._server.get_characteristic(self._response_char)
-        char.value = bytearray(frame)
-        # Notify subscribed consumers of the new value.
-        self._server.update_value(self._service_uuid, self._response_char)
-        logger.debug("Sent %d bytes to consumer via response characteristic", len(frame))
+        # Serialize and pace notifications: writing char.value and calling
+        # update_value() back-to-back can overwrite a value before the OS has
+        # transmitted the previous notification, silently dropping frames.
+        async with self._send_lock:
+            char = self._server.get_characteristic(self._response_char)
+            char.value = bytearray(frame)
+            # Notify subscribed consumers of the new value.
+            self._server.update_value(self._service_uuid, self._response_char)
+            logger.debug(
+                "Sent %d bytes to consumer via response characteristic", len(frame)
+            )
+            if self._notify_interval > 0:
+                await asyncio.sleep(self._notify_interval)
 
     async def close(self) -> None:
         server = self._server
