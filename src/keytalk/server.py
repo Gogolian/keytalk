@@ -71,6 +71,9 @@ class PromptStreamer(Protocol):
     def stream(self, prompt: str) -> AsyncIterator[str]:
         ...  # pragma: no cover - structural typing only
 
+    def list_models(self) -> Awaitable[List[str]]:
+        ...  # pragma: no cover - optional, structural typing only
+
 
 def build_prompt_from_messages(messages: List[Dict[str, object]]) -> str:
     """Flatten Ollama ``/api/chat`` messages into a single prompt string.
@@ -372,7 +375,8 @@ class OllamaBridgeServer:
             return
         if path == "/api/tags" and method == "GET":
             await self._write_json(
-                writer, 200, self._tags_payload(), keep_alive=request.keep_alive
+                writer, 200, await self._tags_payload(),
+                keep_alive=request.keep_alive,
             )
             return
         if path in ("/api/ps",) and method == "GET":
@@ -397,11 +401,33 @@ class OllamaBridgeServer:
             keep_alive=request.keep_alive,
         )
 
-    def _tags_payload(self) -> Dict[str, object]:
-        return {"models": [self._model_entry()]}
+    async def _tags_payload(self) -> Dict[str, object]:
+        names = await self._discover_models()
+        if not names:
+            return {"models": [self._model_entry()]}
+        return {"models": [self._model_entry(name) for name in names]}
 
-    def _model_entry(self) -> Dict[str, object]:
-        name = self._model if ":" in self._model else f"{self._model}:latest"
+    async def _discover_models(self) -> List[str]:
+        """Ask the remote host for its model list, if the client supports it.
+
+        Falls back to an empty list (so the caller uses the configured model)
+        when the client has no ``list_models`` capability or the host cannot be
+        reached.
+        """
+
+        list_models = getattr(self._client, "list_models", None)
+        if list_models is None:
+            return []
+        try:
+            names = await list_models()
+        except Exception:  # noqa: BLE001 - discovery is best-effort
+            logger.warning("could not fetch model list from host", exc_info=True)
+            return []
+        return [str(name) for name in names if name]
+
+    def _model_entry(self, model: Optional[str] = None) -> Dict[str, object]:
+        raw = model if model is not None else self._model
+        name = raw if ":" in raw else f"{raw}:latest"
         return {
             "name": name,
             "model": name,

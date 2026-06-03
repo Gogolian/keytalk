@@ -69,6 +69,8 @@ class MessageType(IntEnum):
     RESPONSE = 2
     ERROR = 3
     CANCEL = 4
+    ACK = 5
+    LIST_MODELS = 6
 
 
 class Flags(IntFlag):
@@ -331,6 +333,18 @@ class FrameStreamEncoder:
         self._seq = 0
         self._started = False
         self._finished = False
+
+    @property
+    def next_seq(self) -> int:
+        """Sequence number the next emitted frame will carry."""
+
+        return self._seq
+
+    @property
+    def has_started(self) -> bool:
+        """Whether a START frame has already been emitted."""
+
+        return self._started
 
     def _emit(self, payload: bytes, last: bool) -> Frame:
         flags = Flags.NONE

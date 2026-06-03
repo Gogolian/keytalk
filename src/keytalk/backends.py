@@ -43,6 +43,16 @@ class LLMBackend(abc.ABC):
         """
         raise NotImplementedError
 
+    async def list_models(self) -> list[str]:
+        """Return the names of the models this backend can serve.
+
+        The default returns an empty list (the consumer then falls back to the
+        statically configured model name).  Backends that talk to a real server
+        override this to report the models that server actually has loaded.
+        """
+
+        return []
+
 
 class EchoBackend(LLMBackend):
     """Test backend that streams the prompt back one word at a time."""
@@ -171,6 +181,34 @@ class OllamaBackend(LLMBackend):
         finally:
             await worker_future
 
+    async def list_models(self) -> list[str]:
+        """Return the model names reported by Ollama's ``/api/tags`` endpoint."""
+
+        loop = asyncio.get_running_loop()
+
+        def worker() -> object:
+            url = f"{self._host}/api/tags"
+            request = urllib.request.Request(url, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.URLError as exc:
+                return OllamaError(f"cannot reach Ollama: {exc}")
+            except Exception as exc:  # pragma: no cover - defensive
+                return exc
+
+        result = await loop.run_in_executor(None, worker)
+        if isinstance(result, Exception):
+            raise result
+        models = result.get("models", []) if isinstance(result, dict) else []
+        names: list[str] = []
+        for entry in models:
+            if isinstance(entry, dict):
+                name = entry.get("name") or entry.get("model")
+                if name:
+                    names.append(str(name))
+        return names
+
 
 class LMStudioError(Exception):
     """Raised when the LM Studio HTTP API cannot be reached or errors out."""
@@ -281,3 +319,31 @@ class LMStudioBackend(LLMBackend):
                 return content
         
         return None
+
+    async def list_models(self) -> list[str]:
+        """Return the model ids reported by LM Studio's ``/v1/models`` endpoint."""
+
+        loop = asyncio.get_running_loop()
+
+        def worker() -> object:
+            url = f"{self._host}/v1/models"
+            request = urllib.request.Request(url, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.URLError as exc:
+                return LMStudioError(f"cannot reach LM Studio: {exc}")
+            except Exception as exc:  # pragma: no cover - defensive
+                return exc
+
+        result = await loop.run_in_executor(None, worker)
+        if isinstance(result, Exception):
+            raise result
+        data = result.get("data", []) if isinstance(result, dict) else []
+        names: list[str] = []
+        for entry in data:
+            if isinstance(entry, dict):
+                name = entry.get("id")
+                if name:
+                    names.append(str(name))
+        return names

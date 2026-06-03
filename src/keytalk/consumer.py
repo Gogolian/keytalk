@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import codecs
 import itertools
+import json
 import logging
-from typing import AsyncIterator, Dict, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
 from .protocol import (
     DEFAULT_ATT_MTU,
@@ -23,6 +24,7 @@ from .protocol import (
     chunk_message,
     max_payload_for_mtu,
 )
+from .reliability import make_ack_frame
 from .transport import Transport
 
 __all__ = ["ConsumerClient", "RemoteError", "_PendingRequest"]
@@ -40,8 +42,10 @@ class _PendingRequest:
     """Tracks reassembly and streaming for one in-flight request.
 
     Response (or error) frames are validated for ordering and pushed onto a
-    queue so consumers can stream them.  Completion is signalled with a sentinel
-    so an async iterator terminates cleanly.
+    queue so consumers can stream them.  Out-of-order frames (which happen when
+    a notification is dropped and later retransmitted) are buffered and replayed
+    in sequence rather than treated as a fatal error.  Completion is signalled
+    with a sentinel so an async iterator terminates cleanly.
     """
 
     _END = object()
@@ -50,36 +54,53 @@ class _PendingRequest:
         self.message_id = message_id
         self._queue: "asyncio.Queue[object]" = asyncio.Queue()
         self._next_seq = 0
+        self._reorder: Dict[int, Frame] = {}
         self._started = False
         self._done = False
 
+    @property
+    def ack_seq(self) -> int:
+        """Next contiguous sequence number expected (cumulative ACK value)."""
+
+        return self._next_seq
+
     def feed(self, frame: Frame) -> None:
-        """Validate and enqueue an inbound frame for this request."""
+        """Validate and enqueue an inbound frame for this request.
+
+        Frames may arrive out of order or be duplicated by retransmission.  We
+        buffer anything ahead of the next expected sequence number and drop
+        anything already consumed, so only contiguous frames are delivered.
+        """
 
         if self._done:
             logger.debug("frame for already-finished request %s", self.message_id)
             return
 
-        if frame.is_start:
-            self._started = True
-            self._next_seq = 0
-        elif not self._started:
-            self._fail(
-                ProtocolError(
-                    f"response {self.message_id} started without a START frame"
-                )
+        # Duplicate of an already-consumed or already-buffered frame: ignore.
+        if frame.seq < self._next_seq or frame.seq in self._reorder:
+            logger.debug(
+                "ignoring duplicate frame seq=%d for %s", frame.seq, self.message_id
             )
             return
 
-        if frame.seq != self._next_seq:
-            self._fail(
-                ProtocolError(
-                    f"out-of-order response frame for {self.message_id}: "
-                    f"expected {self._next_seq}, got {frame.seq}"
+        self._reorder[frame.seq] = frame
+        # Deliver every frame that is now contiguous from _next_seq onwards.
+        while self._next_seq in self._reorder:
+            self._process(self._reorder.pop(self._next_seq))
+            if self._done:
+                break
+            self._next_seq += 1
+
+    def _process(self, frame: Frame) -> None:
+        if frame.seq == 0:
+            if not frame.is_start:
+                self._fail(
+                    ProtocolError(
+                        f"response {self.message_id} started without a START frame"
+                    )
                 )
-            )
-            return
-        self._next_seq += 1
+                return
+            self._started = True
 
         if frame.msg_type == MessageType.ERROR:
             # Error payloads can also span multiple frames; accumulate until END.
@@ -96,6 +117,7 @@ class _PendingRequest:
             return
 
         if frame.is_end:
+            self._next_seq += 1
             self._done = True
             self._queue.put_nowait(self._END)
 
@@ -152,6 +174,10 @@ class ConsumerClient:
             raise ValueError("max_payload_size must be positive")
         self._timeout = timeout
         self._pending: Dict[int, _PendingRequest] = {}
+        # Final ACK value for recently-completed messages, so a retransmitted
+        # tail frame (arriving after we stopped tracking the request) can still
+        # be acknowledged and the host's sender can drain.
+        self._completed_acks: Dict[int, int] = {}
         # message_id 0 is reserved/avoided; ids wrap within the 16-bit space.
         self._ids = itertools.cycle(range(1, 0x10000))
 
@@ -177,13 +203,31 @@ class ConsumerClient:
         except ProtocolError:
             logger.exception("dropping malformed response frame")
             return
+        # The consumer never expects ACK frames itself; ignore defensively.
+        if frame.msg_type == MessageType.ACK:
+            return
         pending = self._pending.get(frame.message_id)
         if pending is None:
-            logger.debug("response for unknown message %s", frame.message_id)
+            # The request already finished; re-ack so a retransmitted tail frame
+            # lets the host's sender drain instead of timing out.
+            ack = self._completed_acks.get(frame.message_id)
+            if ack is not None:
+                await self._send_ack(frame.message_id, ack)
+            else:
+                logger.debug("response for unknown message %s", frame.message_id)
             return
         if frame.is_start:
             logger.info("✓ Started receiving response (msg_id=%d)", frame.message_id)
         pending.feed(frame)
+        # Acknowledge the highest contiguous sequence received so the host can
+        # release acked frames and retransmit anything still missing.
+        await self._send_ack(frame.message_id, pending.ack_seq)
+
+    async def _send_ack(self, message_id: int, ack_seq: int) -> None:
+        try:
+            await self._transport.send(make_ack_frame(message_id, ack_seq).encode())
+        except Exception:  # pragma: no cover - best effort over a failing link
+            logger.debug("failed to send ACK for %s", message_id, exc_info=True)
 
     # -- public API -----------------------------------------------------------
 
@@ -191,32 +235,43 @@ class ConsumerClient:
         for _ in range(0x10000):
             candidate = next(self._ids)
             if candidate not in self._pending:
+                # Reusing an id invalidates any stale completed-ack record.
+                self._completed_acks.pop(candidate, None)
                 return candidate
         raise RuntimeError("no free message ids available")
 
-    async def _send_prompt(self, message_id: int, prompt: str) -> None:
-        logger.info("Sending prompt (msg_id=%d, %d chars)...", message_id, len(prompt))
-        frames = chunk_message(
-            MessageType.PROMPT,
+    async def _send_message(
+        self, message_id: int, msg_type: MessageType, payload: bytes
+    ) -> None:
+        logger.info(
+            "Sending %s (msg_id=%d, %d bytes)...",
+            msg_type.name,
             message_id,
-            prompt.encode("utf-8"),
+            len(payload),
+        )
+        frames = chunk_message(
+            msg_type,
+            message_id,
+            payload,
             self._max_payload,
         )
         for frame in frames:
             await self._transport.send(frame.encode())
-        logger.info("✓ Prompt sent, waiting for response...")
+        logger.info("✓ %s sent, waiting for response...", msg_type.name)
 
     def stream(self, prompt: str) -> AsyncIterator[str]:
         """Send ``prompt`` and yield response text pieces as they arrive."""
 
-        return self._stream(prompt)
+        return self._stream(prompt.encode("utf-8"), MessageType.PROMPT)
 
-    async def _stream(self, prompt: str) -> AsyncIterator[str]:
+    async def _stream(
+        self, payload: bytes, msg_type: MessageType
+    ) -> AsyncIterator[str]:
         message_id = self._alloc_id()
         pending = _PendingRequest(message_id)
         self._pending[message_id] = pending
         try:
-            await self._send_prompt(message_id, prompt)
+            await self._send_message(message_id, msg_type, payload)
             iterator = pending.__aiter__()
             while True:
                 try:
@@ -227,10 +282,33 @@ class ConsumerClient:
                     break
                 yield piece
         finally:
+            # Remember the final ACK so late retransmissions of the tail can
+            # still be acknowledged, then stop tracking the live request.
+            self._completed_acks[message_id] = pending.ack_seq
             self._pending.pop(message_id, None)
 
     async def generate(self, prompt: str) -> str:
         """Send ``prompt`` and return the complete response text."""
 
-        parts = [piece async for piece in self._stream(prompt)]
+        parts = [piece async for piece in self._stream(prompt.encode("utf-8"), MessageType.PROMPT)]
         return "".join(parts)
+
+    async def list_models(self) -> List[str]:
+        """Ask the host which models it can serve.
+
+        Sends a LIST_MODELS request and parses the host's JSON reply (an object
+        of the form ``{"models": [...]}``).  Returns an empty list if the host
+        reports no models or sends an unexpected payload.
+        """
+
+        parts = [piece async for piece in self._stream(b"", MessageType.LIST_MODELS)]
+        text = "".join(parts).strip()
+        if not text:
+            return []
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning("host sent malformed model list: %r", text[:200])
+            return []
+        models = obj.get("models", []) if isinstance(obj, dict) else []
+        return [str(name) for name in models if name]
