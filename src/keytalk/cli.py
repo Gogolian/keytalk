@@ -17,7 +17,7 @@ import asyncio
 import sys
 from typing import List, Optional
 
-from .backends import OllamaBackend
+from .backends import OllamaBackend, LMStudioBackend
 from .consumer import ConsumerClient
 from .host import HostService
 from .server import DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_PORT, OllamaBridgeServer
@@ -27,12 +27,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="keytalk", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    host = sub.add_parser("host", help="run the BLE host bridging to Ollama")
-    host.add_argument("--model", default="llama3", help="Ollama model name")
+    host = sub.add_parser("host", help="run the BLE host bridging to Ollama or LM Studio")
+    host.add_argument("--model", default="llama3", help="model name")
+    host.add_argument(
+        "--backend",
+        choices=["ollama", "lmstudio"],
+        default="ollama",
+        help="LLM backend to use (default: ollama)",
+    )
     host.add_argument(
         "--ollama-host",
         default="http://localhost:11434",
-        help="base URL of the Ollama server",
+        help="base URL of the Ollama server (for --backend=ollama)",
+    )
+    host.add_argument(
+        "--lmstudio-host",
+        default="http://localhost:1234",
+        help="base URL of the LM Studio server (for --backend=lmstudio)",
     )
     host.add_argument("--name", default="keytalk", help="advertised BLE name")
 
@@ -75,18 +86,41 @@ def _build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--timeout", type=float, default=5.0, help="scan duration (s)"
     )
+    scan.add_argument(
+        "--simple",
+        action="store_true",
+        help="output just addresses, one per line",
+    )
     return parser
 
 
 async def _run_host(args: argparse.Namespace) -> int:
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
     from .ble.peripheral import BlessPeripheralTransport
 
-    backend = OllamaBackend(model=args.model, host=args.ollama_host)
+    # Select backend
+    if args.backend == "lmstudio":
+        backend = LMStudioBackend(model=args.model, host=args.lmstudio_host)
+        backend_info = f"LM Studio: {args.lmstudio_host}"
+    else:  # ollama
+        backend = OllamaBackend(model=args.model, host=args.ollama_host)
+        backend_info = f"Ollama: {args.ollama_host}"
+    
     transport = BlessPeripheralTransport(name=args.name)
     host = HostService(transport, backend)
     await host.start()
-    print(f"keytalk host advertising as {args.name!r}; serving model "
-          f"{args.model!r}. Press Ctrl-C to stop.", file=sys.stderr)
+    print(f"\nkeytalk host ready!\n"
+          f"  Advertising as: {args.name!r}\n"
+          f"  Backend: {args.backend}\n"
+          f"  Model: {args.model!r}\n"
+          f"  Server: {backend_info}\n"
+          f"\nWaiting for consumer connections... (Press Ctrl-C to stop)\n", file=sys.stderr)
     try:
         await asyncio.Event().wait()  # run until interrupted
     finally:
@@ -145,8 +179,34 @@ async def _run_scan(args: argparse.Namespace) -> int:
     if not devices:
         print("no keytalk hosts found", file=sys.stderr)
         return 1
-    for device in devices:
-        print(f"{device.address}\t{device.name or '<unknown>'}")
+    
+    if args.simple:
+        # Simple output for scripting
+        for device in devices:
+            print(device.address)
+        return 0
+    
+    # Detailed output
+    print(f"Found {len(devices)} keytalk host(s):\n")
+    for i, device in enumerate(devices, 1):
+        # Get the local name from advertisement data if available
+        adv_name = None
+        if hasattr(device, 'metadata') and device.metadata:
+            adv_name = device.metadata.get('name')
+        if not adv_name and hasattr(device, 'details'):
+            # Try to get advertised local name from details
+            details = device.details
+            if hasattr(details, 'name'):
+                adv_name = details.name
+        
+        display_name = adv_name or device.name or '<unknown>'
+        rssi = getattr(device, 'rssi', None)
+        rssi_str = f" (RSSI: {rssi} dBm)" if rssi is not None else ""
+        
+        print(f"  [{i}] Address: {device.address}")
+        print(f"      BLE Name: {display_name}{rssi_str}")
+        print(f"      (Use this address with: keytalk consume --address {device.address})")
+        print()
     return 0
 
 

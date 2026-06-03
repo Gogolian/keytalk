@@ -11,6 +11,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import json
+import logging
 import urllib.error
 import urllib.request
 from typing import AsyncIterator, Optional
@@ -22,7 +23,11 @@ __all__ = [
     "OllamaBackend",
     "OllamaError",
     "parse_ollama_line",
+    "LMStudioBackend",
+    "LMStudioError",
 ]
+
+logger = logging.getLogger("keytalk.backends")
 
 
 class LLMBackend(abc.ABC):
@@ -119,6 +124,7 @@ class OllamaBackend(LLMBackend):
         self._timeout = timeout
 
     async def generate(self, prompt: str) -> AsyncIterator[str]:
+        logger.info("Starting Ollama generation for model=%r, prompt=%r", self._model, prompt[:100])
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[object]" = asyncio.Queue()
 
@@ -131,18 +137,23 @@ class OllamaBackend(LLMBackend):
                 url, data=body, headers={"Content-Type": "application/json"}
             )
             try:
+                logger.debug("Sending request to Ollama at %s", url)
                 with urllib.request.urlopen(
                     request, timeout=self._timeout
                 ) as response:
+                    logger.info("Connected to Ollama, streaming response")
                     for raw_line in response:
                         loop.call_soon_threadsafe(queue.put_nowait, raw_line)
             except urllib.error.URLError as exc:
+                logger.error("Failed to reach Ollama: %s", exc)
                 loop.call_soon_threadsafe(
                     queue.put_nowait, OllamaError(f"cannot reach Ollama: {exc}")
                 )
             except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Unexpected error in Ollama worker: %s", exc)
                 loop.call_soon_threadsafe(queue.put_nowait, exc)
             finally:
+                logger.debug("Ollama worker finished")
                 loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
 
         worker_future = loop.run_in_executor(None, worker)
@@ -159,3 +170,114 @@ class OllamaBackend(LLMBackend):
                     yield fragment
         finally:
             await worker_future
+
+
+class LMStudioError(Exception):
+    """Raised when the LM Studio HTTP API cannot be reached or errors out."""
+
+
+class LMStudioBackend(LLMBackend):
+    """Stream completions from a local LM Studio server using OpenAI-compatible API.
+
+    LM Studio provides an OpenAI-compatible endpoint at /v1/chat/completions.
+    The blocking HTTP request runs in a worker thread; decoded lines are pushed
+    onto an :class:`asyncio.Queue` and yielded as they arrive so the host can
+    forward tokens to the consumer without waiting for the full completion.
+    """
+
+    _DONE = object()
+
+    def __init__(
+        self,
+        model: str = "gemma-4-31b-it",
+        host: str = "http://localhost:1234",
+        *,
+        timeout: float = 300.0,
+    ) -> None:
+        self._model = model
+        self._host = host.rstrip("/")
+        self._timeout = timeout
+
+    async def generate(self, prompt: str) -> AsyncIterator[str]:
+        logger.info("Starting LM Studio generation for model=%r, prompt=%r", self._model, prompt[:100])
+        loop = asyncio.get_running_loop()
+        queue: "asyncio.Queue[object]" = asyncio.Queue()
+
+        def worker() -> None:
+            url = f"{self._host}/v1/chat/completions"
+            body = json.dumps({
+                "model": self._model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+                "temperature": 0.7,
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}
+            )
+            try:
+                logger.debug("Sending request to LM Studio at %s", url)
+                with urllib.request.urlopen(
+                    request, timeout=self._timeout
+                ) as response:
+                    logger.info("Connected to LM Studio, streaming response")
+                    for raw_line in response:
+                        loop.call_soon_threadsafe(queue.put_nowait, raw_line)
+            except urllib.error.URLError as exc:
+                logger.error("Failed to reach LM Studio: %s", exc)
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, LMStudioError(f"cannot reach LM Studio: {exc}")
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Unexpected error in LM Studio worker: %s", exc)
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                logger.debug("LM Studio worker finished")
+                loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
+
+        worker_future = loop.run_in_executor(None, worker)
+        try:
+            while True:
+                item = await queue.get()
+                if item is self._DONE:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                assert isinstance(item, (bytes, bytearray))
+                fragment = self._parse_openai_sse_line(bytes(item))
+                if fragment:
+                    yield fragment
+        finally:
+            await worker_future
+
+    def _parse_openai_sse_line(self, line: bytes) -> Optional[str]:
+        """Extract text fragment from OpenAI-compatible SSE stream.
+
+        LM Studio uses Server-Sent Events format:
+        data: {"choices":[{"delta":{"content":"text"}}]}
+        """
+        line = line.strip()
+        if not line or line == b"data: [DONE]":
+            return None
+        
+        # SSE lines start with "data: "
+        if line.startswith(b"data: "):
+            line = line[6:]  # Remove "data: " prefix
+        
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            # Skip malformed lines (empty data, etc.)
+            return None
+        
+        if "error" in obj:
+            raise LMStudioError(str(obj["error"]))
+        
+        # Extract content from OpenAI-style streaming response
+        choices = obj.get("choices", [])
+        if choices and len(choices) > 0:
+            delta = choices[0].get("delta", {})
+            content = delta.get("content")
+            if content:
+                return content
+        
+        return None

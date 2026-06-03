@@ -14,6 +14,7 @@ lazily so keytalk works without it installed.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Optional
 
 from ..transport import Transport, TransportClosed
@@ -25,6 +26,8 @@ from .constants import (
 )
 
 __all__ = ["BlessPeripheralTransport"]
+
+logger = logging.getLogger("keytalk.ble.peripheral")
 
 
 def _import_bless():
@@ -62,7 +65,7 @@ class BlessPeripheralTransport(Transport):
         _import_bless()
         from bless import (  # type: ignore[import-not-found]
             BlessServer,
-            BlessGATTCharacteristicProperties,
+            GATTCharacteristicProperties,
             GATTAttributePermissions,
         )
 
@@ -72,6 +75,7 @@ class BlessPeripheralTransport(Transport):
         # When the consumer writes the prompt characteristic, forward the bytes.
         def _write_request(characteristic, value, **_kwargs) -> None:
             data = bytes(value)
+            logger.info("Consumer wrote %d bytes to prompt characteristic", len(data))
             assert self._loop is not None
             asyncio.run_coroutine_threadsafe(self._dispatch(data), self._loop)
 
@@ -80,8 +84,8 @@ class BlessPeripheralTransport(Transport):
         await server.add_new_service(self._service_uuid)
 
         prompt_props = (
-            BlessGATTCharacteristicProperties.write
-            | BlessGATTCharacteristicProperties.write_without_response
+            GATTCharacteristicProperties.write
+            | GATTCharacteristicProperties.write_without_response
         )
         prompt_perms = GATTAttributePermissions.writeable
         await server.add_new_characteristic(
@@ -93,20 +97,21 @@ class BlessPeripheralTransport(Transport):
         )
 
         response_props = (
-            BlessGATTCharacteristicProperties.read
-            | BlessGATTCharacteristicProperties.notify
+            GATTCharacteristicProperties.read
+            | GATTCharacteristicProperties.notify
         )
         response_perms = GATTAttributePermissions.readable
         await server.add_new_characteristic(
             self._service_uuid,
             self._response_char,
             response_props,
-            b"",
+            None,
             response_perms,
         )
 
         await server.start()
         self._server = server
+        logger.info("BLE peripheral started, advertising as '%s'", self._name)
 
     async def send(self, frame: bytes) -> None:
         if self._server is None:
@@ -115,6 +120,7 @@ class BlessPeripheralTransport(Transport):
         char.value = bytearray(frame)
         # Notify subscribed consumers of the new value.
         self._server.update_value(self._service_uuid, self._response_char)
+        logger.debug("Sent %d bytes to consumer via response characteristic", len(frame))
 
     async def close(self) -> None:
         server = self._server

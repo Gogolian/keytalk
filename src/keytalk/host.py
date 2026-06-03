@@ -92,8 +92,10 @@ class HostService:
             return
 
         if message is None:
+            logger.debug("Received frame fragment (message incomplete)")
             return
         if message.msg_type == MessageType.PROMPT:
+            logger.info("Received complete prompt (msg_id=%d): %r", message.message_id, message.text()[:100])
             self._spawn(self._handle_prompt(message.message_id, message.text()))
         elif message.msg_type == MessageType.CANCEL:
             # Cancellation targets a prompt by id; the cooperative model here is
@@ -113,18 +115,22 @@ class HostService:
     # -- prompt handling ------------------------------------------------------
 
     async def _handle_prompt(self, message_id: int, prompt: str) -> None:
-        logger.debug("handling prompt %s (%d chars)", message_id, len(prompt))
+        logger.info("Starting to handle prompt %s (%d chars)", message_id, len(prompt))
         encoder = FrameStreamEncoder(
             MessageType.RESPONSE, message_id, self._max_payload
         )
         try:
+            token_count = 0
             async for fragment in self._backend.generate(prompt):
                 if not fragment:
                     continue
+                token_count += 1
+                logger.debug("Received token #%d from backend (msg_id=%d)", token_count, message_id)
                 for frame in encoder.push(fragment.encode("utf-8")):
                     await self._transport.send(frame.encode())
             for frame in encoder.finish():
                 await self._transport.send(frame.encode())
+            logger.info("Completed prompt %s (%d tokens generated)", message_id, token_count)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - report any backend failure
