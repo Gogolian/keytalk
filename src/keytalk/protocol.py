@@ -28,6 +28,7 @@ exactly one per frame, which lets the receiver detect drops or reordering.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
@@ -46,6 +47,9 @@ __all__ = [
     "chunk_message",
     "Reassembler",
     "FrameStreamEncoder",
+    "compute_message_checksum",
+    "encode_delta_payload",
+    "decode_delta_payload",
 ]
 
 PROTOCOL_VERSION = 1
@@ -71,6 +75,7 @@ class MessageType(IntEnum):
     CANCEL = 4
     ACK = 5
     LIST_MODELS = 6
+    DELTA_PROMPT = 7  # Incremental prompt with checksum reference
 
 
 class Flags(IntFlag):
@@ -80,6 +85,7 @@ class Flags(IntFlag):
     START = 1
     END = 2
     COMPRESSED = 4  # Payload is zlib-compressed
+    DELTA = 8  # Message is a delta (prefix + new content)
 
 
 class ProtocolError(Exception):
@@ -163,7 +169,7 @@ class Frame:
             raise ProtocolError(f"unknown message type: {raw_type}") from exc
         # Flags is an IntFlag; reject bits we do not understand so that a
         # corrupted byte does not silently look like a valid boundary marker.
-        known = int(Flags.START | Flags.END | Flags.COMPRESSED)
+        known = int(Flags.START | Flags.END | Flags.COMPRESSED | Flags.DELTA)
         if raw_flags & ~known:
             raise ProtocolError(f"unknown flag bits set: {raw_flags:#04x}")
         return cls(
@@ -404,3 +410,40 @@ class FrameStreamEncoder:
         chunk = bytes(self._buf)
         self._buf.clear()
         return [self._emit(chunk, last=True)]
+
+
+def compute_message_checksum(data: bytes) -> str:
+    """Compute a SHA-256 checksum for message content.
+    
+    Returns the first 16 hex characters (64 bits) for bandwidth efficiency.
+    """
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def encode_delta_payload(checksum_prefix: str, delta_content: bytes) -> bytes:
+    """Encode a delta message payload with checksum + new content.
+    
+    Format: <checksum_len><checksum><delta_content>
+    - checksum_len: 1 byte indicating length of checksum string
+    - checksum: UTF-8 encoded checksum string
+    - delta_content: the new bytes to append
+    """
+    checksum_bytes = checksum_prefix.encode('utf-8')
+    if len(checksum_bytes) > 255:
+        raise ValueError("Checksum too long")
+    return bytes([len(checksum_bytes)]) + checksum_bytes + delta_content
+
+
+def decode_delta_payload(payload: bytes) -> tuple[str, bytes]:
+    """Decode a delta message payload.
+    
+    Returns: (checksum_prefix, delta_content)
+    """
+    if len(payload) < 1:
+        raise ProtocolError("Delta payload too short")
+    checksum_len = payload[0]
+    if len(payload) < 1 + checksum_len:
+        raise ProtocolError("Delta payload truncated")
+    checksum = payload[1:1 + checksum_len].decode('utf-8')
+    delta_content = payload[1 + checksum_len:]
+    return checksum, delta_content

@@ -25,6 +25,9 @@ from .protocol import (
     ProtocolError,
     chunk_message,
     max_payload_for_mtu,
+    compute_message_checksum,
+    encode_delta_payload,
+    decode_delta_payload,
 )
 from .reliability import make_ack_frame
 from .transport import Transport
@@ -166,6 +169,7 @@ class ConsumerClient:
         max_payload_size: Optional[int] = None,
         timeout: float = DEFAULT_TIMEOUT,
         compress_prompts: bool = True,
+        enable_delta_messages: bool = True,
     ) -> None:
         self._transport = transport
         self._max_payload = (
@@ -177,6 +181,7 @@ class ConsumerClient:
             raise ValueError("max_payload_size must be positive")
         self._timeout = timeout
         self._compress_prompts = compress_prompts
+        self._enable_delta_messages = enable_delta_messages
         self._pending: Dict[int, _PendingRequest] = {}
         # Final ACK value for recently-completed messages, so a retransmitted
         # tail frame (arriving after we stopped tracking the request) can still
@@ -184,6 +189,9 @@ class ConsumerClient:
         self._completed_acks: Dict[int, int] = {}
         # message_id 0 is reserved/avoided; ids wrap within the 16-bit space.
         self._ids = itertools.cycle(range(1, 0x10000))
+        # Track conversation history for delta detection
+        self._conversation_history: bytes = b""
+        self._history_checksum: str = ""
 
     async def start(self) -> None:
         self._transport.on_receive(self._on_frame)
@@ -247,6 +255,30 @@ class ConsumerClient:
     async def _send_message(
         self, message_id: int, msg_type: MessageType, payload: bytes
     ) -> None:
+        # Try delta encoding for prompts if enabled and we have history
+        is_delta = False
+        if (self._enable_delta_messages and 
+            msg_type == MessageType.PROMPT and 
+            self._conversation_history and 
+            len(payload) > len(self._conversation_history)):
+            
+            # Check if the new message starts with the old conversation history
+            if payload[:len(self._conversation_history)] == self._conversation_history:
+                # Extract only the new part
+                delta_content = payload[len(self._conversation_history):]
+                original_payload_size = len(payload)
+                
+                # Encode with checksum reference
+                payload = encode_delta_payload(self._history_checksum, delta_content)
+                is_delta = True
+                
+                logger.info(
+                    "Detected delta prompt: %d bytes -> %d bytes (%.1f%% saved via delta)",
+                    original_payload_size,
+                    len(payload),
+                    100 * (1 - len(payload) / original_payload_size)
+                )
+        
         # Compress prompts to reduce BLE transmission time
         compressed = False
         original_size = len(payload)
@@ -284,16 +316,22 @@ class ConsumerClient:
             payload,
             self._max_payload,
         )
-        # Mark first frame as compressed if we compressed the payload
-        if compressed and frames:
-            frames[0] = Frame(
-                msg_type=frames[0].msg_type,
-                message_id=frames[0].message_id,
-                seq=frames[0].seq,
-                payload=frames[0].payload,
-                flags=frames[0].flags | Flags.COMPRESSED,
-                version=frames[0].version,
-            )
+        # Mark first frame with appropriate flags
+        if frames:
+            flags = frames[0].flags
+            if compressed:
+                flags |= Flags.COMPRESSED
+            if is_delta:
+                flags |= Flags.DELTA
+            if flags != frames[0].flags:
+                frames[0] = Frame(
+                    msg_type=frames[0].msg_type,
+                    message_id=frames[0].message_id,
+                    seq=frames[0].seq,
+                    payload=frames[0].payload,
+                    flags=flags,
+                    version=frames[0].version,
+                )
         for frame in frames:
             await self._transport.send(frame.encode())
         logger.info("✓ %s sent, waiting for response...", msg_type.name)
@@ -309,8 +347,16 @@ class ConsumerClient:
         message_id = self._alloc_id()
         pending = _PendingRequest(message_id)
         self._pending[message_id] = pending
+        
+        # Track the original prompt for history
+        original_prompt = payload
+        
         try:
             await self._send_message(message_id, msg_type, payload)
+            
+            # Collect the response for history tracking
+            response_parts: List[str] = []
+            
             iterator = pending.__aiter__()
             while True:
                 try:
@@ -319,7 +365,21 @@ class ConsumerClient:
                     )
                 except StopAsyncIteration:
                     break
+                response_parts.append(piece)
                 yield piece
+            
+            # Update conversation history if this was a successful prompt
+            if msg_type == MessageType.PROMPT and self._enable_delta_messages:
+                response_text = "".join(response_parts)
+                # Build new history: old_prompt + old_response + new_prompt + new_response
+                new_history = original_prompt + response_text.encode("utf-8")
+                self._conversation_history = new_history
+                self._history_checksum = compute_message_checksum(new_history)
+                logger.debug(
+                    "Updated conversation history: %d bytes, checksum=%s",
+                    len(self._conversation_history),
+                    self._history_checksum
+                )
         finally:
             # Remember the final ACK so late retransmissions of the tail can
             # still be acknowledged, then stop tracking the live request.

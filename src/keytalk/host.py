@@ -26,6 +26,8 @@ from .protocol import (
     ProtocolError,
     Reassembler,
     max_payload_for_mtu,
+    compute_message_checksum,
+    decode_delta_payload,
 )
 from .reliability import ReliableSender
 from .transport import Transport
@@ -59,6 +61,9 @@ class HostService:
         self._tasks: Set["asyncio.Task[None]"] = set()
         self._senders: Dict[int, ReliableSender] = {}
         self._started = False
+        # Track conversation history for delta message reconstruction
+        self._conversation_history: bytes = b""
+        self._history_checksum: str = ""
 
     async def start(self) -> None:
         """Register the frame handler and bring the transport up."""
