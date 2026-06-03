@@ -55,8 +55,9 @@ DEFAULT_MODEL = "keytalk"
 #: Version string reported through ``/api/version``; some clients check it.
 OLLAMA_VERSION = "0.6.4"
 #: Context window advertised through ``/api/show`` (clients use this to size
-#: prompts).  A conservative default that suits most local models.
-DEFAULT_CONTEXT_LENGTH = 8192
+#: prompts).  Copilot's prompt renderer needs a large budget or it fails to fit
+#: the agent prompt ("No lowest priority node found"), so default high.
+DEFAULT_CONTEXT_LENGTH = 128000
 
 # Cap a single request body so a misbehaving client cannot exhaust memory.
 MAX_BODY_BYTES = 16 * 1024 * 1024
