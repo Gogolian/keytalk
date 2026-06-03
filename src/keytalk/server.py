@@ -54,6 +54,9 @@ DEFAULT_PORT = 11434  # the port a real Ollama server listens on
 DEFAULT_MODEL = "keytalk"
 #: Version string reported through ``/api/version``; some clients check it.
 OLLAMA_VERSION = "0.6.4"
+#: Context window advertised through ``/api/show`` (clients use this to size
+#: prompts).  A conservative default that suits most local models.
+DEFAULT_CONTEXT_LENGTH = 8192
 
 # Cap a single request body so a misbehaving client cannot exhaust memory.
 MAX_BODY_BYTES = 16 * 1024 * 1024
@@ -385,8 +388,14 @@ class OllamaBridgeServer:
             )
             return
         if path == "/api/show" and method == "POST":
+            try:
+                show_body = request.json()
+            except (ValueError, json.JSONDecodeError):
+                show_body = {}
+            show_model = str(show_body.get("model") or show_body.get("name") or "") or None
             await self._write_json(
-                writer, 200, self._show_payload(), keep_alive=request.keep_alive
+                writer, 200, self._show_payload(show_model),
+                keep_alive=request.keep_alive,
             )
             return
         if path == "/api/generate" and method == "POST":
@@ -444,14 +453,24 @@ class OllamaBridgeServer:
             },
         }
 
-    def _show_payload(self) -> Dict[str, object]:
+    def _show_payload(self, model: Optional[str] = None) -> Dict[str, object]:
+        details = self._model_entry(model)["details"]
         return {
             "license": "",
             "modelfile": "",
             "parameters": "",
             "template": "",
-            "details": self._model_entry()["details"],
-            "model_info": {},
+            "details": details,
+            # VS Code (and other clients) read model_info for the context
+            # window; advertise a generous default so prompts are not clipped.
+            "model_info": {
+                "general.architecture": "keytalk",
+                "keytalk.context_length": DEFAULT_CONTEXT_LENGTH,
+            },
+            # Clients filter models by capability: tool-calling clients such as
+            # GitHub Copilot only register a model if it reports "tools".  The
+            # remote host bridges to a real model, so advertise the common set.
+            "capabilities": ["completion", "tools"],
         }
 
     # -- completion endpoints -------------------------------------------------

@@ -317,6 +317,17 @@ class DiscoveryEndpointTests(ServerTestBase):
         self.assertEqual(resp.status, 200)
         self.assertIn("details", resp.json())
 
+    async def test_show_advertises_tool_capability(self):
+        # Copilot only registers models whose /api/show reports "tools".
+        server = await self._serve(FakeStreamer())
+        resp = await _request(
+            server.host, server.port, "POST", "/api/show",
+            body=json.dumps({"model": "keytalk"}).encode(),
+        )
+        data = resp.json()
+        self.assertIn("tools", data["capabilities"])
+        self.assertIn("completion", data["capabilities"])
+
     async def test_ps_endpoint(self):
         server = await self._serve(FakeStreamer())
         resp = await _request(server.host, server.port, "GET", "/api/ps")
