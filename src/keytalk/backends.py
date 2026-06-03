@@ -128,10 +128,12 @@ class OllamaBackend(LLMBackend):
         host: str = "http://localhost:11434",
         *,
         timeout: float = 300.0,
+        num_ctx: Optional[int] = 32768,
     ) -> None:
         self._model = model
         self._host = host.rstrip("/")
         self._timeout = timeout
+        self._num_ctx = num_ctx
 
     async def generate(self, prompt: str) -> AsyncIterator[str]:
         logger.info("Starting Ollama generation for model=%r, prompt=%r", self._model, prompt[:100])
@@ -140,9 +142,17 @@ class OllamaBackend(LLMBackend):
 
         def worker() -> None:
             url = f"{self._host}/api/generate"
-            body = json.dumps(
-                {"model": self._model, "prompt": prompt, "stream": True}
-            ).encode("utf-8")
+            request_body: dict[str, object] = {
+                "model": self._model,
+                "prompt": prompt,
+                "stream": True,
+            }
+            if self._num_ctx is not None:
+                # Load the model with a larger context window so big agent
+                # prompts don't overflow Ollama's default (which can be as
+                # small as 4096 tokens and yields an n_keep >= n_ctx error).
+                request_body["options"] = {"num_ctx": self._num_ctx}
+            body = json.dumps(request_body).encode("utf-8")
             request = urllib.request.Request(
                 url, data=body, headers={"Content-Type": "application/json"}
             )

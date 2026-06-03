@@ -1,9 +1,13 @@
 """Tests for the LLM backends (fakes + Ollama line parsing)."""
 
+import io
+import json
 import unittest
+from unittest import mock
 
 from keytalk.backends import (
     EchoBackend,
+    OllamaBackend,
     OllamaError,
     StaticBackend,
     parse_ollama_line,
@@ -52,6 +56,36 @@ class OllamaLineParsingTests(unittest.TestCase):
     def test_invalid_json_raises(self):
         with self.assertRaises(OllamaError):
             parse_ollama_line(b"not json")
+
+
+class OllamaRequestBodyTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _capture(captured):
+        def fake_urlopen(request, timeout=None):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return io.BytesIO(b'{"response": "hi", "done": true}\n')
+
+        return fake_urlopen
+
+    async def test_num_ctx_sent_as_option(self):
+        captured: dict = {}
+        with mock.patch(
+            "keytalk.backends.urllib.request.urlopen",
+            self._capture(captured),
+        ):
+            backend = OllamaBackend(model="m", num_ctx=8192)
+            await _collect(backend, "hello")
+        self.assertEqual(captured["body"]["options"], {"num_ctx": 8192})
+
+    async def test_num_ctx_omitted_when_none(self):
+        captured: dict = {}
+        with mock.patch(
+            "keytalk.backends.urllib.request.urlopen",
+            self._capture(captured),
+        ):
+            backend = OllamaBackend(model="m", num_ctx=None)
+            await _collect(backend, "hello")
+        self.assertNotIn("options", captured["body"])
 
 
 if __name__ == "__main__":

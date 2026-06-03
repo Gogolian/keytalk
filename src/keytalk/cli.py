@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import sys
 from typing import List, Optional
 
@@ -44,6 +45,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--lmstudio-host",
         default="http://localhost:1234",
         help="base URL of the LM Studio server (for --backend=lmstudio)",
+    )
+    host.add_argument(
+        "--num-ctx",
+        type=int,
+        default=32768,
+        help="context window (tokens) to load the Ollama model with; raise "
+        "this if large agent prompts overflow the model's default context",
     )
     host.add_argument("--name", default="keytalk", help="advertised BLE name")
 
@@ -109,7 +117,9 @@ async def _run_host(args: argparse.Namespace) -> int:
         backend = LMStudioBackend(model=args.model, host=args.lmstudio_host)
         backend_info = f"LM Studio: {args.lmstudio_host}"
     else:  # ollama
-        backend = OllamaBackend(model=args.model, host=args.ollama_host)
+        backend = OllamaBackend(
+            model=args.model, host=args.ollama_host, num_ctx=args.num_ctx
+        )
         backend_info = f"Ollama: {args.ollama_host}"
     
     transport = BlessPeripheralTransport(name=args.name)
@@ -169,7 +179,20 @@ async def _serve_consume(
     server = OllamaBridgeServer(
         client, host=args.host, port=args.port, model=args.model
     )
-    await server.start()
+    try:
+        await server.start()
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(
+                f"error: {args.host}:{args.port} is already in use.\n"
+                f"  Another process (often a running Ollama or a previous "
+                f"`keytalk consume --serve`) is listening there.\n"
+                f"  Find it with:  lsof -nP -iTCP:{args.port} -sTCP:LISTEN\n"
+                f"  Then stop it, or pass a different port with --port.",
+                file=sys.stderr,
+            )
+            return 1
+        raise
     print(
         f"keytalk serving Ollama-compatible API on "
         f"http://{server.host}:{server.port} (model {server.model!r}); "

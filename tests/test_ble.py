@@ -64,5 +64,72 @@ class OptionalDependencyTests(unittest.TestCase):
         BlessPeripheralTransport(name="keytalk-test")
 
 
+class _FakeClient:
+    """Minimal stand-in for a bleak client, no radio required."""
+
+    def __init__(self) -> None:
+        self.is_connected = True
+        self.writes: list = []
+
+    async def write_gatt_char(self, char, frame, response):  # noqa: ANN001
+        self.writes.append(frame)
+
+
+class CentralReconnectTests(unittest.IsolatedAsyncioTestCase):
+    def _transport(self, **kwargs):
+        from keytalk.ble.central import BleakCentralTransport
+
+        return BleakCentralTransport(
+            "AA:BB:CC:DD:EE:FF", reconnect_delay=0, **kwargs
+        )
+
+    async def test_send_reconnects_when_link_dropped(self):
+        t = self._transport()
+        t._client = _FakeClient()
+        t._prompt_char_obj = object()
+
+        await t.send(b"hello")
+        self.assertEqual(t._client.writes, [b"hello"])
+
+        # Simulate a dropped link and a successful reconnect.
+        t._client.is_connected = False
+        connects = []
+
+        async def fake_connect():
+            connects.append(1)
+            t._client = _FakeClient()
+            t._prompt_char_obj = object()
+
+        t._connect = fake_connect
+        await t.send(b"again")
+
+        self.assertEqual(len(connects), 1)
+        self.assertEqual(t._client.writes, [b"again"])
+
+    async def test_send_raises_when_reconnect_exhausted(self):
+        from keytalk.transport import TransportClosed
+
+        t = self._transport(reconnect_attempts=2)
+        t._client = None
+        attempts = []
+
+        async def failing_connect():
+            attempts.append(1)
+            raise RuntimeError("no radio")
+
+        t._connect = failing_connect
+        with self.assertRaises(TransportClosed):
+            await t.send(b"x")
+        self.assertEqual(len(attempts), 2)
+
+    async def test_send_after_close_raises(self):
+        from keytalk.transport import TransportClosed
+
+        t = self._transport()
+        await t.close()
+        with self.assertRaises(TransportClosed):
+            await t.send(b"x")
+
+
 if __name__ == "__main__":
     unittest.main()

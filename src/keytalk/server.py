@@ -588,6 +588,13 @@ class OllamaBridgeServer:
         stream = payload.get("stream", True)
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = _now_unix()
+        logger.info(
+            "/v1/chat/completions: model=%s stream=%s messages=%d prompt=%d chars",
+            model,
+            bool(stream),
+            len(messages),
+            len(prompt),
+        )
 
         if stream:
             await self._stream_openai(
@@ -616,6 +623,19 @@ class OllamaBridgeServer:
             ],
         }
 
+    @staticmethod
+    def _format_bridge_error(exc: BaseException) -> str:
+        """Render a host/transport failure as a user-facing assistant message.
+
+        Returning the failure as ordinary message content (rather than an SSE
+        ``error`` object) means VS Code renders it as a normal reply instead of
+        surfacing the opaque "Response contained no choices" error, and the
+        bridge keeps running for the next request.
+        """
+
+        text = str(exc).strip() or exc.__class__.__name__
+        return f"⚠️ keytalk bridge error: {text}"
+
     async def _stream_openai(
         self,
         request: _Request,
@@ -632,25 +652,56 @@ class OllamaBridgeServer:
                 completion_id, created, model, {"role": "assistant"}, None
             ),
         )
+        pieces = 0
+        chars = 0
+        error_text: Optional[str] = None
         try:
             async for piece in self._client.stream(prompt):
                 if not piece:
                     continue
+                pieces += 1
+                chars += len(piece)
                 await self._write_sse(
                     writer,
                     self._openai_chunk(
                         completion_id, created, model, {"content": piece}, None
                     ),
                 )
-            await self._write_sse(
-                writer,
-                self._openai_chunk(completion_id, created, model, {}, "stop"),
-            )
         except asyncio.CancelledError:  # pragma: no cover - teardown path
             raise
         except Exception as exc:  # noqa: BLE001 - surface any backend failure
             logger.exception("error streaming OpenAI completion")
-            await self._write_sse(writer, {"error": {"message": str(exc)}})
+            error_text = self._format_bridge_error(exc)
+
+        if error_text is None and pieces == 0:
+            logger.warning(
+                "/v1/chat/completions produced no content from the host "
+                "(empty stream); returning a placeholder message"
+            )
+            error_text = self._format_bridge_error(
+                RuntimeError("the host returned no output for this prompt")
+            )
+
+        # Always emit a content chunk + a "stop" finish_reason so the response
+        # is a valid OpenAI choice; on failure the error text rides along as the
+        # message content instead of aborting the stream.
+        if error_text is not None:
+            await self._write_sse(
+                writer,
+                self._openai_chunk(
+                    completion_id, created, model, {"content": error_text}, None
+                ),
+            )
+        await self._write_sse(
+            writer,
+            self._openai_chunk(completion_id, created, model, {}, "stop"),
+        )
+        if error_text is None:
+            logger.info(
+                "/v1/chat/completions streamed %d pieces (%d chars)",
+                pieces,
+                chars,
+            )
         await self._write_sse_done(writer)
         await self._end_chunked(writer)
 
@@ -664,6 +715,7 @@ class OllamaBridgeServer:
         created: int,
     ) -> None:
         parts: List[str] = []
+        error_text: Optional[str] = None
         try:
             async for piece in self._client.stream(prompt):
                 if piece:
@@ -672,13 +724,15 @@ class OllamaBridgeServer:
             raise
         except Exception as exc:  # noqa: BLE001 - surface any backend failure
             logger.exception("error generating OpenAI completion")
-            await self._write_json(
-                writer, 500, {"error": {"message": str(exc)}},
-                keep_alive=request.keep_alive,
-            )
-            return
+            error_text = self._format_bridge_error(exc)
 
         text = "".join(parts)
+        finish_reason = "stop"
+        if error_text is not None:
+            # Deliver the failure as assistant content (keeping the bridge alive
+            # for the next request) rather than a 500 that aborts the client.
+            text = error_text
+            finish_reason = "error"
         obj: Dict[str, object] = {
             "id": completion_id,
             "object": "chat.completion",
@@ -688,7 +742,7 @@ class OllamaBridgeServer:
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {

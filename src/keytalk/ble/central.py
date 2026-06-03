@@ -10,6 +10,7 @@ works without it installed.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -60,6 +61,8 @@ class BleakCentralTransport(Transport):
         prompt_char: str = PROMPT_CHAR_UUID,
         response_char: str = RESPONSE_CHAR_UUID,
         write_with_response: bool = True,
+        reconnect_attempts: int = 5,
+        reconnect_delay: float = 1.0,
     ) -> None:
         super().__init__()
         self._address = address
@@ -67,18 +70,30 @@ class BleakCentralTransport(Transport):
         self._prompt_char = prompt_char
         self._response_char = response_char
         self._write_with_response = write_with_response
+        self._reconnect_attempts = reconnect_attempts
+        self._reconnect_delay = reconnect_delay
         self._client = None  # type: ignore[assignment]
         self._prompt_char_obj = None  # type: ignore[assignment]
         self._response_char_obj = None  # type: ignore[assignment]
+        self._closed = False
+        self._reconnect_lock = asyncio.Lock()
 
     async def start(self) -> None:
         _import_bleak()
+        self._closed = False
+        await self._connect()
+
+    async def _connect(self) -> None:
+        """Open the GATT connection and resolve characteristics/notifications."""
+
         from bleak import BleakClient
 
         logger.info("Connecting to BLE host at %s...", self._address)
         self._client = BleakClient(self._address)
         await self._client.connect()
+        await self._resolve_and_subscribe()
 
+    async def _resolve_and_subscribe(self) -> None:
         # Resolve service and characteristics by iterating directly to avoid
         # ambiguity when multiple items share the same UUID.
         # Find all services matching our UUID
@@ -135,7 +150,6 @@ class BleakCentralTransport(Transport):
         def _notification_handler(_sender: object, data: bytearray) -> None:
             # bleak invokes this from the event loop; schedule dispatch so an
             # async callback can run.
-            import asyncio
             logger.debug("Received %d bytes from host", len(data))
 
             asyncio.ensure_future(self._dispatch(bytes(data)))
@@ -144,15 +158,62 @@ class BleakCentralTransport(Transport):
         await self._client.start_notify(self._response_char_obj, _notification_handler)
         logger.info("✓ Ready to send prompts")
 
+    async def _ensure_connected(self) -> None:
+        """Reconnect transparently if the BLE link dropped between requests.
+
+        A dropped connection (host restart, range, radio glitch) should not
+        kill the bridge.  We try a bounded number of reconnects so the next
+        prompt can succeed instead of permanently raising ``TransportClosed``.
+        """
+
+        if self._closed:
+            raise TransportClosed("BLE central has been closed")
+        if self._client is not None and self._client.is_connected:
+            return
+
+        async with self._reconnect_lock:
+            # Another coroutine may have reconnected while we waited for the lock.
+            if self._closed:
+                raise TransportClosed("BLE central has been closed")
+            if self._client is not None and self._client.is_connected:
+                return
+
+            logger.warning(
+                "BLE link to %s is down; attempting to reconnect...",
+                self._address,
+            )
+            last_exc: Optional[BaseException] = None
+            for attempt in range(1, self._reconnect_attempts + 1):
+                try:
+                    await self._connect()
+                    logger.info(
+                        "✓ Reconnected to host on attempt %d/%d",
+                        attempt, self._reconnect_attempts,
+                    )
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - keep retrying
+                    last_exc = exc
+                    logger.warning(
+                        "reconnect attempt %d/%d failed: %s",
+                        attempt, self._reconnect_attempts, exc,
+                    )
+                    if attempt < self._reconnect_attempts:
+                        await asyncio.sleep(self._reconnect_delay)
+            raise TransportClosed(
+                f"BLE central could not reconnect to {self._address}: {last_exc}"
+            )
+
     async def send(self, frame: bytes) -> None:
-        if self._client is None or not self._client.is_connected:
-            raise TransportClosed("BLE central is not connected")
+        await self._ensure_connected()
         logger.debug("Sending %d bytes to host", len(frame))
         await self._client.write_gatt_char(
             self._prompt_char_obj, frame, response=self._write_with_response
         )
 
     async def close(self) -> None:
+        self._closed = True
         client = self._client
         self._client = None
         if client is not None and client.is_connected:

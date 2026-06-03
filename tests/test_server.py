@@ -587,7 +587,7 @@ class OpenAIEndpointTests(ServerTestBase):
         self.assertEqual(resp.status, 400)
         self.assertIn("message", resp.json()["error"])
 
-    async def test_non_streaming_chat_completions_error_is_500(self):
+    async def test_non_streaming_chat_completions_error_is_graceful(self):
         class ImmediateFail:
             def stream(self, prompt):
                 async def gen():
@@ -603,8 +603,36 @@ class OpenAIEndpointTests(ServerTestBase):
                 {"messages": [{"role": "user", "content": "hi"}], "stream": False}
             ).encode(),
         )
-        self.assertEqual(resp.status, 500)
-        self.assertIn("nope", resp.json()["error"]["message"])
+        # The bridge stays alive and surfaces the failure as assistant content
+        # rather than an HTTP 500 that would abort the client.
+        self.assertEqual(resp.status, 200)
+        choice = resp.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "error")
+        self.assertIn("nope", choice["message"]["content"])
+
+    async def test_streaming_chat_completions_error_is_graceful(self):
+        server = await self._serve(FailingStreamer("kaput"))
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=json.dumps(
+                {"messages": [{"role": "user", "content": "hi"}]}
+            ).encode(),
+        )
+        self.assertEqual(resp.status, 200)
+        events = _parse_sse(resp.text())
+        self.assertEqual(events[-1], "[DONE]")
+        chunks = [e for e in events if isinstance(e, dict)]
+        # No raw SSE error objects: every chunk is a valid completion chunk.
+        for chunk in chunks:
+            self.assertEqual(chunk["object"], "chat.completion.chunk")
+            self.assertNotIn("error", chunk)
+        # The stream still closes with a "stop" finish_reason ...
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        # ... and the error text is delivered as assistant content.
+        content = "".join(
+            c["choices"][0]["delta"].get("content", "") for c in chunks
+        )
+        self.assertIn("kaput", content)
 
     async def test_v1_models_lists_host_models(self):
         streamer = ModelListingStreamer(models=["alpha", "beta"])
