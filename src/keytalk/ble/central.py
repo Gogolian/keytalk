@@ -85,24 +85,51 @@ class BleakCentralTransport(Transport):
         matching_services = [s for s in self._client.services if s.uuid == self._service_uuid]
         if not matching_services:
             raise RuntimeError(f"Service {self._service_uuid} not found on device")
-        
-        # Use the first matching service
-        service = matching_services[0]
-        
-        # Get all characteristics from the service and filter by UUID.
-        # When multiple characteristics share the same UUID, we need to use
-        # the characteristic objects directly rather than UUID strings.
+        if len(matching_services) > 1:
+            logger.warning(
+                "Found %d services with UUID %s (likely a stale macOS GATT "
+                "cache); using the one with the highest handle",
+                len(matching_services), self._service_uuid,
+            )
+
+        # macOS CoreBluetooth caches GATT tables and may surface stale services
+        # and characteristics from previous host runs alongside the live ones.
+        # Writing to a stale characteristic gets ACK'd by the OS cache but never
+        # reaches the running host process. The live attributes always have the
+        # highest handles, so prefer those.
+        service = max(matching_services, key=lambda s: s.handle)
+
         prompt_chars = [c for c in service.characteristics if c.uuid == self._prompt_char]
         response_chars = [c for c in service.characteristics if c.uuid == self._response_char]
-        
+
         if not prompt_chars:
             raise RuntimeError(f"Prompt characteristic {self._prompt_char} not found")
         if not response_chars:
             raise RuntimeError(f"Response characteristic {self._response_char} not found")
-        
-        # Use the first matching characteristic (or could select by properties/handle)
-        self._prompt_char_obj = prompt_chars[0]
-        self._response_char_obj = response_chars[0]
+
+        if len(prompt_chars) > 1 or len(response_chars) > 1:
+            logger.warning(
+                "Duplicate characteristics detected (prompt=%d, response=%d); "
+                "selecting the freshest by handle. If prompts still don't reach "
+                "the host, clear the macOS BLE cache (toggle Bluetooth off/on or "
+                "reset the host advertisement).",
+                len(prompt_chars), len(response_chars),
+            )
+
+        # Prefer a writable prompt characteristic; among candidates pick the
+        # highest handle (the live one).
+        def _writable(c) -> bool:
+            props = getattr(c, "properties", []) or []
+            return "write" in props or "write-without-response" in props
+
+        writable_prompts = [c for c in prompt_chars if _writable(c)] or prompt_chars
+        self._prompt_char_obj = max(writable_prompts, key=lambda c: c.handle)
+        self._response_char_obj = max(response_chars, key=lambda c: c.handle)
+
+        logger.info(
+            "Using prompt char handle=%s, response char handle=%s",
+            self._prompt_char_obj.handle, self._response_char_obj.handle,
+        )
         logger.info("✓ Connected to host")
 
         def _notification_handler(_sender: object, data: bytearray) -> None:
@@ -113,9 +140,8 @@ class BleakCentralTransport(Transport):
 
             asyncio.ensure_future(self._dispatch(bytes(data)))
 
-        await self._client.start_notify(self._response_char_obj, _notification_handler)
         logger.debug("Setting up notifications for responses...")
-        await self._client.start_notify(self._response_char, _notification_handler)
+        await self._client.start_notify(self._response_char_obj, _notification_handler)
         logger.info("✓ Ready to send prompts")
 
     async def send(self, frame: bytes) -> None:
