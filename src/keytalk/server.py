@@ -53,7 +53,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11434  # the port a real Ollama server listens on
 DEFAULT_MODEL = "keytalk"
 #: Version string reported through ``/api/version``; some clients check it.
-OLLAMA_VERSION = "0.1.0"
+OLLAMA_VERSION = "0.6.4"
 
 # Cap a single request body so a misbehaving client cannot exhaust memory.
 MAX_BODY_BYTES = 16 * 1024 * 1024
