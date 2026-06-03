@@ -22,6 +22,7 @@ import asyncio
 import datetime
 import json
 import logging
+import uuid
 from typing import (
     AsyncIterator,
     Awaitable,
@@ -125,6 +126,12 @@ def _now_iso() -> str:
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )
+
+
+def _now_unix() -> int:
+    """Return a Unix timestamp in seconds, as the OpenAI API uses."""
+
+    return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
 
 class _Request:
@@ -405,6 +412,15 @@ class OllamaBridgeServer:
         if path == "/api/chat" and method == "POST":
             await self._handle_chat(request, writer)
             return
+        if path == "/v1/models" and method == "GET":
+            await self._write_json(
+                writer, 200, await self._openai_models_payload(),
+                keep_alive=request.keep_alive,
+            )
+            return
+        if path == "/v1/chat/completions" and method == "POST":
+            await self._handle_openai_chat(request, writer)
+            return
 
         await self._write_json(
             writer, 404, {"error": f"unknown endpoint {request.path}"},
@@ -543,6 +559,166 @@ class OllamaBridgeServer:
             request, writer, prompt, model, bool(stream), envelope, "message"
         )
 
+    async def _handle_openai_chat(
+        self, request: _Request, writer: asyncio.StreamWriter
+    ) -> None:
+        """Serve the OpenAI-compatible ``POST /v1/chat/completions`` endpoint.
+
+        VS Code Copilot's Ollama provider runs inference through the
+        OpenAI-compatible endpoint (``${url}/v1/chat/completions``) rather than
+        ``/api/chat``, so this bridges that request onto the same remote host
+        prompt stream and re-frames the reply as OpenAI chunks.
+        """
+
+        try:
+            payload = request.json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            await self._write_json(
+                writer, 400, {"error": {"message": f"invalid request body: {exc}"}},
+                keep_alive=request.keep_alive,
+            )
+            return
+
+        raw_messages = payload.get("messages")
+        messages: List[Dict[str, object]] = (
+            raw_messages if isinstance(raw_messages, list) else []
+        )
+        prompt = build_prompt_from_messages(messages)
+        model = str(payload.get("model") or self._model)
+        stream = payload.get("stream", True)
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = _now_unix()
+
+        if stream:
+            await self._stream_openai(
+                request, writer, prompt, model, completion_id, created
+            )
+        else:
+            await self._aggregate_openai(
+                request, writer, prompt, model, completion_id, created
+            )
+
+    @staticmethod
+    def _openai_chunk(
+        completion_id: str,
+        created: int,
+        model: str,
+        delta: Dict[str, object],
+        finish_reason: Optional[str],
+    ) -> Dict[str, object]:
+        return {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {"index": 0, "delta": delta, "finish_reason": finish_reason}
+            ],
+        }
+
+    async def _stream_openai(
+        self,
+        request: _Request,
+        writer: asyncio.StreamWriter,
+        prompt: str,
+        model: str,
+        completion_id: str,
+        created: int,
+    ) -> None:
+        await self._begin_sse(writer, request.keep_alive)
+        await self._write_sse(
+            writer,
+            self._openai_chunk(
+                completion_id, created, model, {"role": "assistant"}, None
+            ),
+        )
+        try:
+            async for piece in self._client.stream(prompt):
+                if not piece:
+                    continue
+                await self._write_sse(
+                    writer,
+                    self._openai_chunk(
+                        completion_id, created, model, {"content": piece}, None
+                    ),
+                )
+            await self._write_sse(
+                writer,
+                self._openai_chunk(completion_id, created, model, {}, "stop"),
+            )
+        except asyncio.CancelledError:  # pragma: no cover - teardown path
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface any backend failure
+            logger.exception("error streaming OpenAI completion")
+            await self._write_sse(writer, {"error": {"message": str(exc)}})
+        await self._write_sse_done(writer)
+        await self._end_chunked(writer)
+
+    async def _aggregate_openai(
+        self,
+        request: _Request,
+        writer: asyncio.StreamWriter,
+        prompt: str,
+        model: str,
+        completion_id: str,
+        created: int,
+    ) -> None:
+        parts: List[str] = []
+        try:
+            async for piece in self._client.stream(prompt):
+                if piece:
+                    parts.append(piece)
+        except asyncio.CancelledError:  # pragma: no cover - teardown path
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface any backend failure
+            logger.exception("error generating OpenAI completion")
+            await self._write_json(
+                writer, 500, {"error": {"message": str(exc)}},
+                keep_alive=request.keep_alive,
+            )
+            return
+
+        text = "".join(parts)
+        obj: Dict[str, object] = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+        await self._write_json(
+            writer, 200, obj, keep_alive=request.keep_alive
+        )
+
+    async def _openai_models_payload(self) -> Dict[str, object]:
+        names = await self._discover_models()
+        if not names:
+            names = [self._model]
+        created = _now_unix()
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": created,
+                    "owned_by": "keytalk",
+                }
+                for name in names
+            ],
+        }
+
     async def _stream_completion(
         self,
         request: _Request,
@@ -671,11 +847,32 @@ class OllamaBridgeServer:
         writer.write(head)
         await writer.drain()
 
+    async def _begin_sse(
+        self, writer: asyncio.StreamWriter, keep_alive: bool
+    ) -> None:
+        head = self._status_line(200)
+        head += b"Content-Type: text/event-stream; charset=utf-8\r\n"
+        head += b"Cache-Control: no-cache\r\n"
+        head += b"Transfer-Encoding: chunked\r\n"
+        head += self._connection_header(keep_alive)
+        head += b"\r\n"
+        writer.write(head)
+        await writer.drain()
+
     async def _write_chunk_json(
         self, writer: asyncio.StreamWriter, obj: Dict[str, object]
     ) -> None:
         payload = (json.dumps(obj) + "\n").encode("utf-8")
         await self._write_chunk(writer, payload)
+
+    async def _write_sse(
+        self, writer: asyncio.StreamWriter, obj: Dict[str, object]
+    ) -> None:
+        payload = ("data: " + json.dumps(obj) + "\n\n").encode("utf-8")
+        await self._write_chunk(writer, payload)
+
+    async def _write_sse_done(self, writer: asyncio.StreamWriter) -> None:
+        await self._write_chunk(writer, b"data: [DONE]\n\n")
 
     @staticmethod
     async def _write_chunk(writer: asyncio.StreamWriter, data: bytes) -> None:

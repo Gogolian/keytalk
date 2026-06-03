@@ -501,6 +501,133 @@ class ChatEndpointTests(ServerTestBase):
 
 
 # --------------------------------------------------------------------------- #
+# OpenAI-compatible /v1/chat/completions (used by VS Code Copilot for inference)
+# --------------------------------------------------------------------------- #
+def _parse_sse(text: str) -> List[object]:
+    """Parse a ``text/event-stream`` body into its ``data:`` payloads.
+
+    Returns parsed JSON objects, with the literal ``[DONE]`` sentinel kept as a
+    string so tests can assert on stream termination.
+    """
+
+    events: List[object] = []
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block.startswith("data:"):
+            continue
+        payload = block[len("data:"):].strip()
+        if payload == "[DONE]":
+            events.append("[DONE]")
+        elif payload:
+            events.append(json.loads(payload))
+    return events
+
+
+class OpenAIEndpointTests(ServerTestBase):
+    async def test_streaming_chat_completions(self):
+        fake = FakeStreamer(response="Hi there", piece_size=2)
+        server = await self._serve(fake, model="m")
+        body = json.dumps(
+            {
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "Be nice."},
+                    {"role": "user", "content": "hello"},
+                ],
+            }
+        ).encode()
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions", body=body
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertIn("text/event-stream", resp.headers.get("content-type", ""))
+        events = _parse_sse(resp.text())
+        self.assertEqual(events[-1], "[DONE]")
+        chunks = [e for e in events if isinstance(e, dict)]
+        for chunk in chunks:
+            self.assertEqual(chunk["object"], "chat.completion.chunk")
+            self.assertEqual(chunk["model"], "m")
+        # first chunk announces the assistant role
+        self.assertEqual(chunks[0]["choices"][0]["delta"].get("role"), "assistant")
+        # the final content chunk closes with finish_reason "stop"
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        content = "".join(
+            c["choices"][0]["delta"].get("content", "") for c in chunks
+        )
+        self.assertEqual(content, "Hi there")
+        self.assertEqual(fake.prompts[0], "Be nice.\nUser: hello\nAssistant:")
+
+    async def test_non_streaming_chat_completions(self):
+        fake = FakeStreamer(response="Reply text", piece_size=3)
+        server = await self._serve(fake, model="m")
+        body = json.dumps(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "q"}],
+                "stream": False,
+            }
+        ).encode()
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions", body=body
+        )
+        self.assertEqual(resp.status, 200)
+        data = resp.json()
+        self.assertEqual(data["object"], "chat.completion")
+        choice = data["choices"][0]
+        self.assertEqual(choice["message"]["role"], "assistant")
+        self.assertEqual(choice["message"]["content"], "Reply text")
+        self.assertEqual(choice["finish_reason"], "stop")
+
+    async def test_chat_completions_invalid_json(self):
+        server = await self._serve(FakeStreamer())
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=b"oops",
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertIn("message", resp.json()["error"])
+
+    async def test_non_streaming_chat_completions_error_is_500(self):
+        class ImmediateFail:
+            def stream(self, prompt):
+                async def gen():
+                    if False:
+                        yield ""
+                    raise RuntimeError("nope")
+                return gen()
+
+        server = await self._serve(ImmediateFail())
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=json.dumps(
+                {"messages": [{"role": "user", "content": "hi"}], "stream": False}
+            ).encode(),
+        )
+        self.assertEqual(resp.status, 500)
+        self.assertIn("nope", resp.json()["error"]["message"])
+
+    async def test_v1_models_lists_host_models(self):
+        streamer = ModelListingStreamer(models=["alpha", "beta"])
+        server = await self._serve(streamer)
+        resp = await _request(server.host, server.port, "GET", "/v1/models")
+        self.assertEqual(resp.status, 200)
+        data = resp.json()
+        self.assertEqual(data["object"], "list")
+        ids = [entry["id"] for entry in data["data"]]
+        self.assertEqual(ids, ["alpha", "beta"])
+        for entry in data["data"]:
+            self.assertEqual(entry["object"], "model")
+
+    async def test_v1_models_falls_back_to_configured_model(self):
+        server = await self._serve(FakeStreamer(), model="solo")
+        resp = await _request(server.host, server.port, "GET", "/v1/models")
+        self.assertEqual(resp.status, 200)
+        ids = [entry["id"] for entry in resp.json()["data"]]
+        self.assertEqual(ids, ["solo"])
+
+
+
+# --------------------------------------------------------------------------- #
 # Connection handling
 # --------------------------------------------------------------------------- #
 class ConnectionHandlingTests(ServerTestBase):
