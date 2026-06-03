@@ -206,10 +206,35 @@ class BleakCentralTransport(Transport):
             )
 
     async def send(self, frame: bytes) -> None:
-        await self._ensure_connected()
         logger.debug("Sending %d bytes to host", len(frame))
-        await self._client.write_gatt_char(
-            self._prompt_char_obj, frame, response=self._write_with_response
+        # The link can drop *during* a write (CoreBluetooth raises
+        # "disconnected"), not just between requests, so retry the write after
+        # a transparent reconnect instead of bubbling the failure up.
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, self._reconnect_attempts + 1):
+            await self._ensure_connected()
+            try:
+                await self._client.write_gatt_char(
+                    self._prompt_char_obj,
+                    frame,
+                    response=self._write_with_response,
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reconnect and retry
+                last_exc = exc
+                logger.warning(
+                    "write failed (attempt %d/%d): %s; reconnecting",
+                    attempt, self._reconnect_attempts, exc,
+                )
+                # Drop the dead client so _ensure_connected reconnects next loop.
+                self._client = None
+                if attempt < self._reconnect_attempts:
+                    await asyncio.sleep(self._reconnect_delay)
+        raise TransportClosed(
+            f"BLE write to {self._address} failed after "
+            f"{self._reconnect_attempts} attempts: {last_exc}"
         )
 
     async def close(self) -> None:

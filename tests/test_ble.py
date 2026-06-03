@@ -67,11 +67,16 @@ class OptionalDependencyTests(unittest.TestCase):
 class _FakeClient:
     """Minimal stand-in for a bleak client, no radio required."""
 
-    def __init__(self) -> None:
+    def __init__(self, fail_writes: int = 0) -> None:
         self.is_connected = True
         self.writes: list = []
+        self._fail_writes = fail_writes
 
     async def write_gatt_char(self, char, frame, response):  # noqa: ANN001
+        if self._fail_writes > 0:
+            self._fail_writes -= 1
+            self.is_connected = False
+            raise RuntimeError("disconnected")
         self.writes.append(frame)
 
 
@@ -105,6 +110,25 @@ class CentralReconnectTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(connects), 1)
         self.assertEqual(t._client.writes, [b"again"])
+
+    async def test_send_retries_write_on_mid_write_disconnect(self):
+        # The first write raises "disconnected"; after a reconnect the retry
+        # must succeed instead of bubbling the failure up.
+        t = self._transport(reconnect_attempts=3)
+        t._client = _FakeClient(fail_writes=1)
+        t._prompt_char_obj = object()
+        connects = []
+
+        async def fake_connect():
+            connects.append(1)
+            t._client = _FakeClient()
+            t._prompt_char_obj = object()
+
+        t._connect = fake_connect
+        await t.send(b"payload")
+
+        self.assertEqual(len(connects), 1)
+        self.assertEqual(t._client.writes, [b"payload"])
 
     async def test_send_raises_when_reconnect_exhausted(self):
         from keytalk.transport import TransportClosed
