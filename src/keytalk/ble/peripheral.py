@@ -72,13 +72,18 @@ class BlessPeripheralTransport(Transport):
         self._loop = asyncio.get_running_loop()
         server = BlessServer(name=self._name, loop=self._loop)
 
+        # Track connections
+        def _on_read(characteristic, **_kwargs) -> None:
+            logger.debug("Consumer read from characteristic %s", characteristic)
+
         # When the consumer writes the prompt characteristic, forward the bytes.
         def _write_request(characteristic, value, **_kwargs) -> None:
             data = bytes(value)
-            logger.info("Consumer wrote %d bytes to prompt characteristic", len(data))
+            logger.info("✓ Consumer sent %d bytes", len(data))
             assert self._loop is not None
             asyncio.run_coroutine_threadsafe(self._dispatch(data), self._loop)
 
+        server.read_request_func = _on_read
         server.write_request_func = _write_request
 
         await server.add_new_service(self._service_uuid)

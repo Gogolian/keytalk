@@ -10,12 +10,15 @@ works without it installed.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from ..transport import Transport, TransportClosed
 from .constants import PROMPT_CHAR_UUID, RESPONSE_CHAR_UUID, SERVICE_UUID
 
 __all__ = ["BleakCentralTransport", "discover_hosts"]
+
+logger = logging.getLogger("keytalk.ble.central")
 
 
 def _import_bleak():
@@ -70,21 +73,27 @@ class BleakCentralTransport(Transport):
         _import_bleak()
         from bleak import BleakClient
 
+        logger.info("Connecting to BLE host at %s...", self._address)
         self._client = BleakClient(self._address)
         await self._client.connect()
+        logger.info("✓ Connected to host")
 
         def _notification_handler(_sender: object, data: bytearray) -> None:
             # bleak invokes this from the event loop; schedule dispatch so an
             # async callback can run.
             import asyncio
+            logger.debug("Received %d bytes from host", len(data))
 
             asyncio.ensure_future(self._dispatch(bytes(data)))
 
+        logger.debug("Setting up notifications for responses...")
         await self._client.start_notify(self._response_char, _notification_handler)
+        logger.info("✓ Ready to send prompts")
 
     async def send(self, frame: bytes) -> None:
         if self._client is None or not self._client.is_connected:
             raise TransportClosed("BLE central is not connected")
+        logger.debug("Sending %d bytes to host", len(frame))
         await self._client.write_gatt_char(
             self._prompt_char, frame, response=self._write_with_response
         )

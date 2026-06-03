@@ -181,6 +181,8 @@ class ConsumerClient:
         if pending is None:
             logger.debug("response for unknown message %s", frame.message_id)
             return
+        if frame.is_start:
+            logger.info("✓ Started receiving response (msg_id=%d)", frame.message_id)
         pending.feed(frame)
 
     # -- public API -----------------------------------------------------------
@@ -193,6 +195,7 @@ class ConsumerClient:
         raise RuntimeError("no free message ids available")
 
     async def _send_prompt(self, message_id: int, prompt: str) -> None:
+        logger.info("Sending prompt (msg_id=%d, %d chars)...", message_id, len(prompt))
         frames = chunk_message(
             MessageType.PROMPT,
             message_id,
@@ -201,6 +204,7 @@ class ConsumerClient:
         )
         for frame in frames:
             await self._transport.send(frame.encode())
+        logger.info("✓ Prompt sent, waiting for response...")
 
     def stream(self, prompt: str) -> AsyncIterator[str]:
         """Send ``prompt`` and yield response text pieces as they arrive."""

@@ -129,6 +129,17 @@ async def _run_host(args: argparse.Namespace) -> int:
 
 
 async def _run_consume(args: argparse.Namespace) -> int:
+    import logging
+    import sys
+    
+    # Enable logging to stderr so it doesn't interfere with stdout output
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+        stream=sys.stderr
+    )
+    
     from .ble.central import BleakCentralTransport
 
     transport = BleakCentralTransport(args.address)
