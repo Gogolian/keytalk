@@ -63,6 +63,24 @@ class FailingStreamer:
         raise RuntimeError(self.message)
 
 
+class ModelListingStreamer(FakeStreamer):
+    """A streamer that also reports a model list, like a real consumer client."""
+
+    def __init__(self, models: List[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._models = models
+
+    async def list_models(self) -> List[str]:
+        return list(self._models)
+
+
+class ModelListErrorStreamer(FakeStreamer):
+    """A streamer whose model-list lookup fails, to test graceful fallback."""
+
+    async def list_models(self) -> List[str]:
+        raise RuntimeError("host unreachable")
+
+
 # --------------------------------------------------------------------------- #
 # A tiny async HTTP/1.1 client that understands chunked + content-length
 # --------------------------------------------------------------------------- #
@@ -269,6 +287,26 @@ class DiscoveryEndpointTests(ServerTestBase):
         resp = await _request(server.host, server.port, "GET", "/api/tags")
         names = [m["name"] for m in resp.json()["models"]]
         self.assertEqual(names, ["my-model:7b"])
+
+    async def test_tags_lists_models_reported_by_host(self):
+        streamer = ModelListingStreamer(["llama3:8b", "qwen2.5:latest"])
+        server = await self._serve(streamer, model="keytalk")
+        resp = await _request(server.host, server.port, "GET", "/api/tags")
+        names = [m["name"] for m in resp.json()["models"]]
+        self.assertEqual(names, ["llama3:8b", "qwen2.5:latest"])
+
+    async def test_tags_falls_back_when_host_lists_nothing(self):
+        streamer = ModelListingStreamer([])
+        server = await self._serve(streamer, model="my-model")
+        resp = await _request(server.host, server.port, "GET", "/api/tags")
+        names = [m["name"] for m in resp.json()["models"]]
+        self.assertEqual(names, ["my-model:latest"])
+
+    async def test_tags_falls_back_when_host_errors(self):
+        server = await self._serve(ModelListErrorStreamer(), model="my-model")
+        resp = await _request(server.host, server.port, "GET", "/api/tags")
+        names = [m["name"] for m in resp.json()["models"]]
+        self.assertEqual(names, ["my-model:latest"])
 
     async def test_show_returns_object(self):
         server = await self._serve(FakeStreamer())
@@ -517,6 +555,10 @@ class _SlowBackend(LLMBackend):
             yield ch
 
 
+async def _async_list(items: List[str]) -> List[str]:
+    return list(items)
+
+
 class EndToEndPipelineTests(ServerTestBase):
     async def _make_full_stack(
         self, backend: LLMBackend
@@ -573,6 +615,15 @@ class EndToEndPipelineTests(ServerTestBase):
         )
         for resp in results:
             self.assertEqual(resp.json()["response"], "ANSWER")
+
+    async def test_tags_lists_host_models_through_ble_pipeline(self):
+        backend = StaticBackend("unused", piece_size=2)
+        # The host's backend reports two models; the bridge should surface both.
+        backend.list_models = lambda: _async_list(["llama3:8b", "phi3:mini"])  # type: ignore[method-assign]
+        server, _ = await self._make_full_stack(backend)
+        resp = await _request(server.host, server.port, "GET", "/api/tags")
+        names = [m["name"] for m in resp.json()["models"]]
+        self.assertEqual(names, ["llama3:8b", "phi3:mini"])
 
 
 # --------------------------------------------------------------------------- #
