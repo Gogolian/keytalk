@@ -60,7 +60,7 @@ class HostService:
         self._max_payload = (
             max_payload_size
             if max_payload_size is not None
-            else max_payload_for_mtu(mtu)
+            else max_payload_for_mtu(profile.mtu if profile is not None else mtu)
         )
         if self._max_payload <= 0:
             raise ValueError("max_payload_size must be positive")
