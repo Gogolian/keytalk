@@ -122,6 +122,11 @@ class BleakCentralTransport(Transport):
                 "modes requiring bonding (l2cap_coc, rfcomm) may not be available",
                 exc,
             )
+            # Some OS backends (e.g. WinRT) disconnect on a failed pair attempt.
+            # Reconnect so _resolve_and_subscribe can proceed.
+            if not self._client.is_connected:
+                logger.info("Reconnecting after failed pairing attempt...")
+                await self._client.connect()
 
     async def _resolve_and_subscribe(self) -> None:
         # Resolve service and characteristics by iterating directly to avoid
