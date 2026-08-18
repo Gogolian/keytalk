@@ -99,7 +99,26 @@ class BleakCentralTransport(Transport):
         self._client = BleakClient(self._address)
         await self._client.connect()
         await self._attempt_pair()
-        await self._resolve_and_subscribe()
+        try:
+            await self._resolve_and_subscribe()
+        except OSError as exc:
+            # WinRT (Windows) can abort the CCCD write with ERROR_OPERATION_ABORTED
+            # (-2147023673) when a services-changed event fires mid-connection and
+            # invalidates the just-resolved characteristic objects.  Tear down and
+            # reconnect with a fresh client so GATT discovery runs again.
+            if getattr(exc, "winerror", None) != -2147023673:
+                raise
+            logger.warning(
+                "CCCD write aborted by services-changed event; "
+                "reconnecting with fresh client..."
+            )
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = BleakClient(self._address)
+            await self._client.connect()
+            await self._resolve_and_subscribe()
 
     async def _attempt_pair(self) -> None:
         """Attempt to pair/bond with the host before negotiation.
