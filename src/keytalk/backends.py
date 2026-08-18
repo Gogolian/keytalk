@@ -33,6 +33,7 @@ __all__ = [
     "LLMBackend",
     "EchoBackend",
     "StaticBackend",
+    "DummyFileBackend",
     "OllamaBackend",
     "OllamaError",
     "parse_ollama_line",
@@ -91,6 +92,30 @@ class StaticBackend(LLMBackend):
             raise ValueError("piece_size must be positive")
         self._response = response
         self._piece_size = piece_size
+
+    async def generate(self, prompt: str) -> AsyncIterator[str]:
+        text = self._response
+        for i in range(0, len(text), self._piece_size):
+            await asyncio.sleep(0)
+            yield text[i : i + self._piece_size]
+
+
+class DummyFileBackend(LLMBackend):
+    """Speed-testing backend that streams the contents of a file, ignoring the prompt.
+
+    Reads *response_file* once at construction time so disk I/O never touches
+    the hot path.  Streams the text in ``piece_size``-character chunks with
+    no artificial delay, making it the fastest possible stand-in for a real
+    model when benchmarking transport throughput.
+    """
+
+    def __init__(self, response_file: str = "dummy_response.txt", piece_size: int = 4) -> None:
+        if piece_size <= 0:
+            raise ValueError("piece_size must be positive")
+        with open(response_file, "r", encoding="utf-8") as fh:
+            self._response = fh.read()
+        self._piece_size = piece_size
+        logger.info("DummyFileBackend loaded %d chars from %r", len(self._response), response_file)
 
     async def generate(self, prompt: str) -> AsyncIterator[str]:
         text = self._response

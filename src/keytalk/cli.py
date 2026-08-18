@@ -18,7 +18,7 @@ import errno
 import sys
 from typing import List, Optional
 
-from .backends import OllamaBackend, LMStudioBackend, OpenRouterBackend
+from .backends import OllamaBackend, LMStudioBackend, OpenRouterBackend, DummyFileBackend
 from .consumer import ConsumerClient
 from .host import HostService
 from .modes import profile_for_mode  # still used by _run_host
@@ -33,9 +33,15 @@ def _build_parser() -> argparse.ArgumentParser:
     host.add_argument("--model", default="llama3", help="model name")
     host.add_argument(
         "--backend",
-        choices=["ollama", "lmstudio", "openrouter"],
+        choices=["ollama", "lmstudio", "openrouter", "dummy"],
         default="ollama",
         help="LLM backend to use (default: ollama)",
+    )
+    host.add_argument(
+        "--dummy-file",
+        default="dummy_response.txt",
+        metavar="FILE",
+        help="file whose contents the dummy backend streams (default: dummy_response.txt)",
     )
     host.add_argument(
         "--ollama-host",
@@ -171,6 +177,9 @@ async def _run_host(args: argparse.Namespace) -> int:
     elif args.backend == "openrouter":
         backend = OpenRouterBackend(model=args.model, api_key=args.openrouter_key)
         backend_info = "OpenRouter (https://openrouter.ai)"
+    elif args.backend == "dummy":
+        backend = DummyFileBackend(response_file=args.dummy_file)
+        backend_info = f"dummy file: {args.dummy_file}"
     else:  # ollama
         backend = OllamaBackend(
             model=args.model, host=args.ollama_host, num_ctx=args.num_ctx
