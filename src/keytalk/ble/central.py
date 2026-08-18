@@ -122,10 +122,15 @@ class BleakCentralTransport(Transport):
                 "modes requiring bonding (l2cap_coc, rfcomm) may not be available",
                 exc,
             )
-            # Some OS backends (e.g. WinRT) disconnect on a failed pair attempt.
-            # Reconnect so _resolve_and_subscribe can proceed.
+            # Some OS backends (e.g. WinRT) disconnect on a failed pair attempt and
+            # leave internal GattCharacteristic objects in a closed state. Re-using
+            # the same BleakClient would cause start_notify to raise
+            # "WinError -2147483629: The object has been closed". Create a fresh
+            # client so all WinRT objects are newly allocated.
             if not self._client.is_connected:
                 logger.info("Reconnecting after failed pairing attempt...")
+                from bleak import BleakClient
+                self._client = BleakClient(self._address)
                 await self._client.connect()
 
     async def _resolve_and_subscribe(self) -> None:
