@@ -452,9 +452,7 @@ class ConsumerClient:
             iterator = pending.__aiter__()
             while True:
                 try:
-                    piece = await asyncio.wait_for(
-                        iterator.__anext__(), timeout=self._timeout
-                    )
+                    piece = await iterator.__anext__()
                 except StopAsyncIteration:
                     break
                 response_parts.append(piece)

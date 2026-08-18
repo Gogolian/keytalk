@@ -25,6 +25,8 @@ __all__ = [
     "parse_ollama_line",
     "LMStudioBackend",
     "LMStudioError",
+    "OpenRouterBackend",
+    "OpenRouterError",
 ]
 
 logger = logging.getLogger("keytalk.backends")
@@ -357,3 +359,148 @@ class LMStudioBackend(LLMBackend):
                 if name:
                     names.append(str(name))
         return names
+
+
+class OpenRouterError(Exception):
+    """Raised when the OpenRouter HTTP API cannot be reached or errors out."""
+
+
+class OpenRouterBackend(LLMBackend):
+    """Stream completions from OpenRouter using its OpenAI-compatible API.
+
+    OpenRouter is a hosted gateway to many models (OpenAI, Anthropic, Google,
+    Meta, …).  Requires an API key passed via ``api_key`` or the
+    ``OPENROUTER_API_KEY`` environment variable.  The default model can be
+    overridden per-request via ``model``.
+    """
+
+    _DONE = object()
+    _HOST = "https://openrouter.ai"
+
+    def __init__(
+        self,
+        model: str = "openai/gpt-4o",
+        api_key: str = "",
+        *,
+        timeout: float = 300.0,
+    ) -> None:
+        import os
+        self._model = model
+        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self._timeout = timeout
+
+    def _headers(self) -> dict[str, str]:
+        if not self._api_key:
+            raise OpenRouterError(
+                "OpenRouter API key not set; pass --openrouter-key or set OPENROUTER_API_KEY"
+            )
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+
+    async def generate(self, prompt: str) -> AsyncIterator[str]:
+        logger.info("Starting OpenRouter generation for model=%r, prompt=%r", self._model, prompt[:100])
+        loop = asyncio.get_running_loop()
+        queue: "asyncio.Queue[object]" = asyncio.Queue()
+
+        def worker() -> None:
+            url = f"{self._HOST}/api/v1/chat/completions"
+            body = json.dumps({
+                "model": self._model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+            }).encode("utf-8")
+            try:
+                headers = self._headers()
+            except OpenRouterError as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
+                return
+            request = urllib.request.Request(url, data=body, headers=headers)
+            try:
+                logger.debug("Sending request to OpenRouter at %s", url)
+                with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                    logger.info("Connected to OpenRouter, streaming response")
+                    for raw_line in response:
+                        loop.call_soon_threadsafe(queue.put_nowait, raw_line)
+            except urllib.error.URLError as exc:
+                logger.error("Failed to reach OpenRouter: %s", exc)
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, OpenRouterError(f"cannot reach OpenRouter: {exc}")
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Unexpected error in OpenRouter worker: %s", exc)
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                logger.debug("OpenRouter worker finished")
+                loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
+
+        worker_future = loop.run_in_executor(None, worker)
+        try:
+            while True:
+                item = await queue.get()
+                if item is self._DONE:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                assert isinstance(item, (bytes, bytearray))
+                fragment = self._parse_sse_line(bytes(item))
+                if fragment:
+                    yield fragment
+        finally:
+            await worker_future
+
+    def _parse_sse_line(self, line: bytes) -> Optional[str]:
+        """Extract text fragment from an OpenAI-compatible SSE line."""
+        line = line.strip()
+        if not line or line == b"data: [DONE]":
+            return None
+        if line.startswith(b"data: "):
+            line = line[6:]
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if "error" in obj:
+            raise OpenRouterError(str(obj["error"]))
+        choices = obj.get("choices", [])
+        if choices:
+            delta = choices[0].get("delta", {})
+            content = delta.get("content")
+            if content:
+                return content
+        return None
+
+    async def list_models(self) -> list[str]:
+        """Return model ids from OpenRouter's ``/api/v1/models`` endpoint."""
+        if not self._api_key:
+            return []
+        loop = asyncio.get_running_loop()
+
+        def worker() -> object:
+            url = f"{self._HOST}/api/v1/models"
+            request = urllib.request.Request(
+                url,
+                method="GET",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.URLError as exc:
+                return OpenRouterError(f"cannot reach OpenRouter: {exc}")
+            except Exception as exc:  # pragma: no cover - defensive
+                return exc
+
+        result = await loop.run_in_executor(None, worker)
+        if isinstance(result, Exception):
+            raise result
+        data = result.get("data", []) if isinstance(result, dict) else []
+        names: list[str] = []
+        for entry in data:
+            if isinstance(entry, dict):
+                name = entry.get("id")
+                if name:
+                    names.append(str(name))
+        return sorted(names)

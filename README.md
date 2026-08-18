@@ -3,8 +3,9 @@
 Use a large language model running on **one** machine from **another** machine —
 over **Bluetooth LE** instead of an IP network.
 
-- The **HOST** (e.g. a Mac) runs an LLM such as an [Ollama](https://ollama.com)
-  server and exposes it through a **custom BLE GATT service**.
+- The **HOST** (e.g. a Mac) runs an LLM via [Ollama](https://ollama.com),
+  [LM Studio](https://lmstudio.ai), or [OpenRouter](https://openrouter.ai)
+  and exposes it through a **custom BLE GATT service**.
 - The **CONSUMER** (any nearby machine) connects over BLE, writes prompt chunks,
   and reads streamed response chunks.
 
@@ -38,7 +39,7 @@ consumer → host communication.
 | --- | --- |
 | `keytalk.protocol` | Transport-agnostic framing, chunking, reassembly, streaming encoder. |
 | `keytalk.transport` | `Transport` interface + in-memory loopback used by the tests. |
-| `keytalk.backends` | `LLMBackend` interface, `OllamaBackend`, and test fakes. |
+| `keytalk.backends` | `LLMBackend` interface, `OllamaBackend`, `LMStudioBackend`, `OpenRouterBackend`, and test fakes. |
 | `keytalk.host` | `HostService`: prompt frames -> LLM -> streamed response frames. |
 | `keytalk.consumer` | `ConsumerClient`: prompt -> frames -> reassembled/streamed reply. |
 | `keytalk.ble` | Real radio adapters: `bless` peripheral (host), `bleak` central (consumer). |
@@ -64,10 +65,18 @@ python3 -m pip install -e ".[ble]"      # both
 
 ## Usage
 
-On the **host** (with Ollama already running and a model pulled):
+On the **host**, choose a backend:
 
 ```bash
+# Ollama (default) — model must already be pulled
 keytalk host --model llama3
+
+# LM Studio — point at its local server
+keytalk host --backend lmstudio --lmstudio-host http://localhost:1234 --model gemma-4-31b-it
+
+# OpenRouter — hosted models via API key
+keytalk host --backend openrouter --model anthropic/claude-3.5-sonnet --openrouter-key sk-or-...
+# or set OPENROUTER_API_KEY in the environment instead of passing --openrouter-key
 ```
 
 On the **consumer**:

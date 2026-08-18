@@ -18,7 +18,7 @@ import errno
 import sys
 from typing import List, Optional
 
-from .backends import OllamaBackend, LMStudioBackend
+from .backends import OllamaBackend, LMStudioBackend, OpenRouterBackend
 from .consumer import ConsumerClient
 from .host import HostService
 from .modes import profile_for_mode  # still used by _run_host
@@ -33,7 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
     host.add_argument("--model", default="llama3", help="model name")
     host.add_argument(
         "--backend",
-        choices=["ollama", "lmstudio"],
+        choices=["ollama", "lmstudio", "openrouter"],
         default="ollama",
         help="LLM backend to use (default: ollama)",
     )
@@ -46,6 +46,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--lmstudio-host",
         default="http://localhost:1234",
         help="base URL of the LM Studio server (for --backend=lmstudio)",
+    )
+    host.add_argument(
+        "--openrouter-key",
+        default="",
+        metavar="KEY",
+        help="OpenRouter API key (for --backend=openrouter; falls back to OPENROUTER_API_KEY env var)",
     )
     host.add_argument(
         "--num-ctx",
@@ -156,6 +162,9 @@ async def _run_host(args: argparse.Namespace) -> int:
     if args.backend == "lmstudio":
         backend = LMStudioBackend(model=args.model, host=args.lmstudio_host)
         backend_info = f"LM Studio: {args.lmstudio_host}"
+    elif args.backend == "openrouter":
+        backend = OpenRouterBackend(model=args.model, api_key=args.openrouter_key)
+        backend_info = "OpenRouter (https://openrouter.ai)"
     else:  # ollama
         backend = OllamaBackend(
             model=args.model, host=args.ollama_host, num_ctx=args.num_ctx
