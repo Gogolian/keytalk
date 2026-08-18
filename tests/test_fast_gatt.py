@@ -218,9 +218,9 @@ class FastGattProfileTests(unittest.TestCase):
 # ── end-to-end FAST_GATT integration tests ───────────────────────────────────
 
 class FastGattIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def _make_fast_gatt_pair(self, response: str, mtu: int = LARGE_MTU):
+    async def _make_fast_gatt_pair(self, response: str, mtu: int = LARGE_MTU, *, buffer_response: bool = False):
         lb = _FastLoopback(mtu=mtu)
-        host = HostService(lb.host_t, StaticBackend(response))
+        host = HostService(lb.host_t, StaticBackend(response), buffer_response=buffer_response)
         consumer = ConsumerClient(lb.consumer_t, requested_mode="fast_gatt", timeout=5.0)
         await host.start()
         await consumer.start()
@@ -297,7 +297,7 @@ class FastGattIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_fast_gatt_checksum_verified_end_to_end(self):
         """RESPONSE frames carry a CHECKSUM flag; the Reassembler verifies it."""
         response = "integrity check " * 50
-        _, consumer, lb = await self._make_fast_gatt_pair(response)
+        _, consumer, lb = await self._make_fast_gatt_pair(response, buffer_response=True)
         result = await consumer.generate("prompt")
         self.assertEqual(result, response)
         # At least one RESPONSE frame must carry the CHECKSUM flag.

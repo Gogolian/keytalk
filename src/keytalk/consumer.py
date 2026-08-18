@@ -20,6 +20,7 @@ from typing import AsyncIterator, Dict, List, Optional
 from .modes import LEGACY_PROFILE, Mode, ProfileConfig, negotiate_mode, mode_id_for, make_l2cap_coc_profile
 from .protocol import (
     DEFAULT_ATT_MTU,
+    CHECKSUM_SIZE,
     Flags,
     Frame,
     MessageType,
@@ -71,6 +72,8 @@ class _PendingRequest:
         self._done = False
         self._reassemble = reassemble
         self._inner: Optional[Reassembler] = Reassembler() if reassemble else None
+        self._decompressor: Optional[zlib.Decompress] = None
+        self._running_crc: int = 0
 
     @property
     def ack_seq(self) -> int:
@@ -115,6 +118,8 @@ class _PendingRequest:
                 )
                 return
             self._started = True
+            if not self._reassemble and (frame.flags & Flags.COMPRESSED):
+                self._decompressor = zlib.decompressobj()
 
         if self._reassemble:
             # Route through the inner Reassembler for decompression + CRC32.
@@ -139,7 +144,32 @@ class _PendingRequest:
             # Error payloads can also span multiple frames; accumulate until END.
             self._queue.put_nowait(("error", frame.payload))
         elif frame.msg_type == MessageType.RESPONSE:
-            self._queue.put_nowait(("data", frame.payload))
+            payload = frame.payload
+            if self._decompressor is not None:
+                # Strip and verify CRC32 trailer before decompressing.
+                if frame.is_end and (frame.flags & Flags.CHECKSUM):
+                    if len(payload) < CHECKSUM_SIZE:
+                        self._fail(ProtocolError("CHECKSUM END frame payload too short"))
+                        return
+                    payload_data = payload[:-CHECKSUM_SIZE]
+                    expected_crc = int.from_bytes(payload[-CHECKSUM_SIZE:], "big")
+                    self._running_crc = zlib.crc32(payload_data, self._running_crc) & 0xFFFFFFFF
+                    if self._running_crc != expected_crc:
+                        self._fail(ProtocolError("CRC32 mismatch on reassembled response"))
+                        return
+                    payload = payload_data
+                else:
+                    self._running_crc = zlib.crc32(payload, self._running_crc) & 0xFFFFFFFF
+                try:
+                    decompressed = self._decompressor.decompress(payload)
+                    if frame.is_end:
+                        decompressed += self._decompressor.flush()
+                    payload = decompressed
+                except zlib.error as exc:
+                    self._fail(ProtocolError(f"decompression failed: {exc}"))
+                    return
+            if payload:
+                self._queue.put_nowait(("data", payload))
         else:
             self._fail(
                 ProtocolError(
@@ -434,10 +464,10 @@ class ConsumerClient:
         self, payload: bytes, msg_type: MessageType
     ) -> AsyncIterator[str]:
         message_id = self._alloc_id()
-        # FAST_GATT, L2CAP_COC and CLASSIC_RFCOMM send compressed + checksummed bulk
-        # responses; reassemble them as a single payload rather than streaming raw chunks.
-        reassemble = self._profile.mode in (Mode.FAST_GATT, Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM)
-        pending = _PendingRequest(message_id, reassemble=reassemble)
+        # FAST_GATT, L2CAP_COC and CLASSIC_RFCOMM now use the streaming path by
+        # default; COMPRESSED flag on the START frame triggers incremental
+        # decompression in _PendingRequest so text appears as tokens arrive.
+        pending = _PendingRequest(message_id)
         self._pending[message_id] = pending
         
         # Track the original prompt for history

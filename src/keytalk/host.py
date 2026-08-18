@@ -51,10 +51,12 @@ class HostService:
         profile: Optional[ProfileConfig] = None,
         mtu: int = DEFAULT_ATT_MTU,
         max_payload_size: Optional[int] = None,
+        buffer_response: bool = False,
     ) -> None:
         self._transport = transport
         self._backend = backend
         self._profile = profile or LEGACY_PROFILE
+        self._buffer_response = buffer_response
         self._max_payload = (
             max_payload_size
             if max_payload_size is not None
@@ -191,20 +193,31 @@ class HostService:
         logger.info("Starting to handle prompt %s (%d chars)", message_id, len(prompt))
 
         if self._profile.mode == Mode.FAST_GATT:
-            await self._handle_prompt_fast_gatt(message_id, prompt)
+            if self._buffer_response:
+                await self._handle_prompt_fast_gatt(message_id, prompt)
+            else:
+                await self._handle_prompt_legacy(message_id, prompt, compress=True)
         elif self._profile.mode in (Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM):
-            await self._handle_prompt_stream(message_id, prompt)
+            if self._buffer_response:
+                await self._handle_prompt_stream(message_id, prompt)
+            else:
+                await self._handle_prompt_stream_chunked(message_id, prompt)
         else:
             await self._handle_prompt_legacy(message_id, prompt)
 
-    async def _handle_prompt_legacy(self, message_id: int, prompt: str) -> None:
+    async def _handle_prompt_legacy(self, message_id: int, prompt: str, *, compress: bool = False) -> None:
         """Stream response frames one token at a time (LEGACY / default path)."""
         encoder = FrameStreamEncoder(
-            MessageType.RESPONSE, message_id, self._max_payload
+            MessageType.RESPONSE, message_id, self._max_payload,
+            start_flags=Flags.COMPRESSED if compress else Flags.NONE,
         )
-        sender = ReliableSender(self._transport.send)
+        sender = ReliableSender(
+            self._transport.send,
+            window=self._profile.reliability_window,
+        )
         self._senders[message_id] = sender
         sender.start()
+        compressor = zlib.compressobj(level=6) if compress else None
         try:
             token_count = 0
             async for fragment in self._backend.generate(prompt):
@@ -213,8 +226,16 @@ class HostService:
                 token_count += 1
                 if token_count % 10 == 0:  # Log every 10th token in verbose mode
                     logger.debug("Received %d tokens so far (msg_id=%d)", token_count, message_id)
-                for frame in encoder.push(fragment.encode("utf-8")):
+                data = fragment.encode("utf-8")
+                if compressor is not None:
+                    data = compressor.compress(data) + compressor.flush(zlib.Z_SYNC_FLUSH)
+                for frame in encoder.push(data):
                     await sender.send_frame(frame)
+            if compressor is not None:
+                final_data = compressor.flush(zlib.Z_FINISH)
+                if final_data:
+                    for frame in encoder.push(final_data):
+                        await sender.send_frame(frame)
             for frame in encoder.finish():
                 await sender.send_frame(frame)
             # Block until the consumer has acknowledged every frame so a final
@@ -229,6 +250,55 @@ class HostService:
         finally:
             sender.close()
             self._senders.pop(message_id, None)
+
+    async def _handle_prompt_stream_chunked(self, message_id: int, prompt: str) -> None:
+        """Stream response with per-chunk compression directly (L2CAP_COC / RFCOMM streaming path)."""
+        encoder = FrameStreamEncoder(
+            MessageType.RESPONSE, message_id, self._max_payload,
+            start_flags=Flags.COMPRESSED,
+        )
+        compressor = zlib.compressobj(level=6)
+        try:
+            async for fragment in self._backend.generate(prompt):
+                if not fragment:
+                    continue
+                data = compressor.compress(fragment.encode("utf-8")) + compressor.flush(zlib.Z_SYNC_FLUSH)
+                for frame in encoder.push(data):
+                    await self._transport.send(frame.encode())
+            final_data = compressor.flush(zlib.Z_FINISH)
+            if final_data:
+                for frame in encoder.push(final_data):
+                    await self._transport.send(frame.encode())
+            for frame in encoder.finish():
+                await self._transport.send(frame.encode())
+            logger.info(
+                "Completed %s prompt %s (streamed with compression)",
+                self._profile.mode.value, message_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("backend failed for message %s (%s)", message_id, self._profile.mode.value)
+            payload = str(exc).encode("utf-8") or b"backend error"
+            pieces = [
+                payload[i : i + self._max_payload]
+                for i in range(0, len(payload), self._max_payload)
+            ] or [b""]
+            for idx, piece in enumerate(pieces):
+                flags = Flags.NONE
+                if idx == 0 and not encoder.has_started:
+                    flags |= Flags.START
+                if idx == len(pieces) - 1:
+                    flags |= Flags.END
+                await self._transport.send(
+                    Frame(
+                        msg_type=MessageType.ERROR,
+                        message_id=message_id,
+                        seq=encoder.next_seq + idx,
+                        payload=piece,
+                        flags=flags,
+                    ).encode()
+                )
 
     async def _handle_prompt_stream(self, message_id: int, prompt: str) -> None:
         """Collect full response, compress, CRC32, send directly (L2CAP_COC / RFCOMM path).

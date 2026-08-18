@@ -394,6 +394,7 @@ class FrameStreamEncoder:
         max_payload_size: int,
         *,
         checksum: bool = False,
+        start_flags: Flags = Flags.NONE,
     ) -> None:
         if max_payload_size <= 0:
             raise ValueError("max_payload_size must be positive")
@@ -406,6 +407,7 @@ class FrameStreamEncoder:
         self._started = False
         self._finished = False
         self._running_crc = 0  # updated as each payload chunk is emitted
+        self._start_flags = start_flags
 
     @property
     def next_seq(self) -> int:
@@ -422,7 +424,7 @@ class FrameStreamEncoder:
     def _emit(self, payload: bytes, last: bool) -> Frame:
         flags = Flags.NONE
         if not self._started:
-            flags |= Flags.START
+            flags |= Flags.START | self._start_flags
             self._started = True
         if last:
             flags |= Flags.END

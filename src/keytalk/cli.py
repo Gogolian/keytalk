@@ -71,6 +71,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable verbose logging (shows frame-by-frame details)",
     )
+    host.add_argument(
+        "--buffer-response",
+        action="store_true",
+        help="buffer the full LLM response before sending (higher compression "
+             "ratio but no visible streaming on the consumer)",
+    )
 
     consume = sub.add_parser(
         "consume",
@@ -173,7 +179,7 @@ async def _run_host(args: argparse.Namespace) -> int:
     
     transport = BlessPeripheralTransport(name=args.name, supported_modes=supported_modes)
     profile = profile_for_mode(args.mode)
-    host = HostService(transport, backend, profile=profile)
+    host = HostService(transport, backend, profile=profile, buffer_response=args.buffer_response)
     await host.start()
     print(f"\nkeytalk host ready!\n"
           f"  Advertising as: {args.name!r}\n"

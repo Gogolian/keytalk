@@ -260,7 +260,7 @@ class L2CAPCOCIntegrationTests(unittest.IsolatedAsyncioTestCase):
         profile = make_l2cap_coc_profile(_L2CAP_MTU)
 
         # Capture raw stream bytes to count frames: read after the run.
-        host = HostService(host_t, StaticBackend(response), profile=profile)
+        host = HostService(host_t, StaticBackend(response), profile=profile, buffer_response=True)
         consumer = ConsumerClient(consumer_t, profile=profile, timeout=5.0)
         await host.start()
         await consumer.start()
@@ -335,7 +335,7 @@ class L2CAPCOCThroughputBenchmark(unittest.IsolatedAsyncioTestCase):
                 await _orig(frame)
 
             host_t.send = _counting_send  # type: ignore[method-assign]
-            host = HostService(host_t, StaticBackend(response), profile=profile)
+            host = HostService(host_t, StaticBackend(response), profile=profile, buffer_response=True)
             consumer = ConsumerClient(consumer_t, profile=profile, timeout=10.0)
             await host.start()
             await consumer.start()
