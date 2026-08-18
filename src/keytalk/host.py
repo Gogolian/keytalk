@@ -172,15 +172,22 @@ class HostService:
         except ValueError as exc:
             logger.warning("SELECT: mode %r not implemented — staying on legacy: %s", mode.value, exc)
             return
+        prev_mode = self._profile.mode
         self._profile = new_profile
         self._negotiated_mtu = reported_mtu
         # Only resize response frames for modes that exploit larger MTUs.
         if new_profile.mode != Mode.LEGACY:
             self._max_payload = max_payload_for_mtu(reported_mtu)
-        logger.info(
-            "Mode negotiated: %s (consumer reported MTU=%d, max_payload=%d)",
-            new_profile.mode.value, reported_mtu, self._max_payload,
-        )
+        if prev_mode != new_profile.mode:
+            logger.info(
+                "Bluetooth mode switched: %s → %s (consumer MTU=%d, max_payload=%d)",
+                prev_mode.value, new_profile.mode.value, reported_mtu, self._max_payload,
+            )
+        else:
+            logger.info(
+                "Bluetooth mode: %s (consumer MTU=%d, max_payload=%d)",
+                new_profile.mode.value, reported_mtu, self._max_payload,
+            )
 
     def _spawn(self, coro: "asyncio.coroutines") -> None:
         task = asyncio.ensure_future(coro)
@@ -190,14 +197,18 @@ class HostService:
     # -- prompt handling ------------------------------------------------------
 
     async def _handle_prompt(self, message_id: int, prompt: str) -> None:
-        logger.info("Starting to handle prompt %s (%d chars)", message_id, len(prompt))
+        mode = self._profile.mode
+        logger.info(
+            "Prompt %d via %s (%d chars)",
+            message_id, mode.value, len(prompt),
+        )
 
-        if self._profile.mode == Mode.FAST_GATT:
+        if mode == Mode.FAST_GATT:
             if self._buffer_response:
                 await self._handle_prompt_fast_gatt(message_id, prompt)
             else:
                 await self._handle_prompt_legacy(message_id, prompt, compress=True)
-        elif self._profile.mode in (Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM):
+        elif mode in (Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM):
             if self._buffer_response:
                 await self._handle_prompt_stream(message_id, prompt)
             else:
@@ -207,6 +218,10 @@ class HostService:
 
     async def _handle_prompt_legacy(self, message_id: int, prompt: str, *, compress: bool = False) -> None:
         """Stream response frames one token at a time (LEGACY / default path)."""
+        logger.info(
+            "msg_id=%d: streaming token-by-token via GATT notify (window=%d, compress=%s)",
+            message_id, self._profile.reliability_window, compress,
+        )
         encoder = FrameStreamEncoder(
             MessageType.RESPONSE, message_id, self._max_payload,
             start_flags=Flags.COMPRESSED if compress else Flags.NONE,
@@ -253,6 +268,10 @@ class HostService:
 
     async def _handle_prompt_stream_chunked(self, message_id: int, prompt: str) -> None:
         """Stream response with per-chunk compression directly (L2CAP_COC / RFCOMM streaming path)."""
+        logger.info(
+            "msg_id=%d: streaming per-token with zlib compression (%s)",
+            message_id, self._profile.mode.value,
+        )
         encoder = FrameStreamEncoder(
             MessageType.RESPONSE, message_id, self._max_payload,
             start_flags=Flags.COMPRESSED,
@@ -306,6 +325,10 @@ class HostService:
         Both L2CAP COC and RFCOMM provide reliable ordered streams, so the
         Go-Back-N ``ReliableSender`` is not needed; frames go to the transport directly.
         """
+        logger.info(
+            "msg_id=%d: buffering full response, then compress+chunk (%s)",
+            message_id, self._profile.mode.value,
+        )
         encoder = FrameStreamEncoder(MessageType.RESPONSE, message_id, self._max_payload)
         try:
             parts: list[bytes] = []
@@ -313,7 +336,10 @@ class HostService:
                 if fragment:
                     parts.append(fragment.encode("utf-8"))
             full_response = b"".join(parts)
-
+            logger.debug(
+                "msg_id=%d: collected %d bytes, compressing...",
+                message_id, len(full_response),
+            )
             compressed = zlib.compress(full_response, level=6)
             if len(compressed) >= len(full_response):
                 wire_payload = full_response
@@ -377,6 +403,10 @@ class HostService:
 
     async def _handle_prompt_fast_gatt(self, message_id: int, prompt: str) -> None:
         """Collect full response, compress, checksum, then send (FAST_GATT path)."""
+        logger.info(
+            "msg_id=%d: buffering full response, then compress+chunk (FAST_GATT, window=%d)",
+            message_id, self._profile.reliability_window,
+        )
         sender = ReliableSender(
             self._transport.send,
             window=self._profile.reliability_window,
@@ -391,7 +421,10 @@ class HostService:
                 if fragment:
                     parts.append(fragment.encode("utf-8"))
             full_response = b"".join(parts)
-
+            logger.debug(
+                "msg_id=%d: collected %d bytes, compressing...",
+                message_id, len(full_response),
+            )
             # Compress the full response.
             compressed = zlib.compress(full_response, level=6)
             if len(compressed) >= len(full_response):

@@ -104,11 +104,18 @@ class ReliableSender:
     async def send_frame(self, frame: Frame) -> None:
         """Transmit ``frame`` reliably, blocking while the window is full."""
 
+        _logged_blocked = False
         while True:
             if self._failed is not None:
                 raise self._failed
             if len(self._inflight) < self._window:
                 break
+            if not _logged_blocked:
+                logger.debug(
+                    "window full (%d/%d inflight) — waiting for ACK before seq=%d",
+                    len(self._inflight), self._window, frame.seq,
+                )
+                _logged_blocked = True
             self._window_event.clear()
             await self._window_event.wait()
 

@@ -267,6 +267,7 @@ class ConsumerClient:
             return  # explicit profile supplied at construction — skip
         host_modes = await self._transport.read_caps()
         new_profile = negotiate_mode(host_modes, self._requested_mode)
+        prev_mode = self._profile.mode
         self._profile = new_profile
         # For FAST_GATT and L2CAP_COC, size max_payload and switch write mode.
         if new_profile.mode == Mode.FAST_GATT:
@@ -298,11 +299,18 @@ class ConsumerClient:
             flags=Flags.START | Flags.END,
         )
         await self._transport.send(select_frame.encode())
-        logger.info(
-            "Negotiated mode: %s (MTU=%d, host caps=%s)",
-            new_profile.mode.value, mtu,
-            host_modes if host_modes is not None else "n/a (legacy host)",
-        )
+        if prev_mode != new_profile.mode:
+            logger.info(
+                "Bluetooth mode: %s → %s (MTU=%d, host caps=%s)",
+                prev_mode.value, new_profile.mode.value, mtu,
+                host_modes if host_modes is not None else "n/a (legacy host)",
+            )
+        else:
+            logger.info(
+                "Bluetooth mode: %s (MTU=%d, host caps=%s)",
+                new_profile.mode.value, mtu,
+                host_modes if host_modes is not None else "n/a (legacy host)",
+            )
 
     async def close(self) -> None:
         await self._transport.close()
