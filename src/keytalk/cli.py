@@ -140,6 +140,18 @@ async def _run_host(args: argparse.Namespace) -> int:
     
     from .ble.peripheral import BlessPeripheralTransport
 
+    # Advertise the modes this host can actually serve over the GATT transport.
+    # LEGACY and FAST_GATT both run over standard BLE GATT (no pairing needed).
+    # L2CAP_COC and RFCOMM require dedicated channel setup beyond the basic CLI.
+    _mode_to_supported: dict[str, list[str]] = {
+        "legacy":    ["legacy"],
+        "fast_gatt": ["legacy", "fast_gatt"],
+        "l2cap_coc": ["legacy", "fast_gatt", "l2cap_coc"],
+        "rfcomm":    ["legacy", "fast_gatt", "l2cap_coc", "rfcomm"],
+        "auto":      ["legacy", "fast_gatt"],
+    }
+    supported_modes = _mode_to_supported.get(args.mode, ["legacy", "fast_gatt"])
+
     # Select backend
     if args.backend == "lmstudio":
         backend = LMStudioBackend(model=args.model, host=args.lmstudio_host)
@@ -150,7 +162,7 @@ async def _run_host(args: argparse.Namespace) -> int:
         )
         backend_info = f"Ollama: {args.ollama_host}"
     
-    transport = BlessPeripheralTransport(name=args.name, supported_modes=["legacy"])
+    transport = BlessPeripheralTransport(name=args.name, supported_modes=supported_modes)
     profile = profile_for_mode(args.mode)
     host = HostService(transport, backend, profile=profile)
     await host.start()

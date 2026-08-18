@@ -98,7 +98,30 @@ class BleakCentralTransport(Transport):
         logger.info("Connecting to BLE host at %s...", self._address)
         self._client = BleakClient(self._address)
         await self._client.connect()
+        await self._attempt_pair()
         await self._resolve_and_subscribe()
+
+    async def _attempt_pair(self) -> None:
+        """Attempt to pair/bond with the host before negotiation.
+
+        Bonding is required for L2CAP_COC (encrypted PSM) and Classic RFCOMM.
+        On macOS CoreBluetooth, explicit pairing is not available; the OS
+        auto-pairs on first access to an encrypted characteristic.
+        """
+        try:
+            await self._client.pair()
+            logger.info("✓ Paired/bonded with host")
+        except NotImplementedError:
+            logger.debug(
+                "Explicit pairing not supported on this platform "
+                "(CoreBluetooth auto-pairs on encrypted characteristic access)"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Pairing attempt failed: %s — continuing without pairing; "
+                "modes requiring bonding (l2cap_coc, rfcomm) may not be available",
+                exc,
+            )
 
     async def _resolve_and_subscribe(self) -> None:
         # Resolve service and characteristics by iterating directly to avoid
