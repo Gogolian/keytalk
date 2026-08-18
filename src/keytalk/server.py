@@ -810,7 +810,11 @@ class OllamaBridgeServer:
             raise
         except Exception as exc:  # noqa: BLE001 - surface any backend failure
             logger.exception("error streaming completion")
-            await self._write_chunk_json(writer, {"error": str(exc)})
+            # Include done=true so clients using Symbol.asyncIterator don't
+            # throw "Did not receive done or success response in stream".
+            final = envelope("", True)
+            final["error"] = str(exc)
+            await self._write_chunk_json(writer, final)
         await self._end_chunked(writer)
 
     async def _aggregate_completion(
