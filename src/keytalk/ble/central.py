@@ -289,12 +289,26 @@ class BleakCentralTransport(Transport):
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect and retry
                 last_exc = exc
-                logger.warning(
-                    "write failed (attempt %d/%d): %s; reconnecting",
-                    attempt, self._reconnect_attempts, exc,
+                # A GATT protocol error (e.g. code 0 "Unknown code") is a
+                # transient ATT-level rejection; the BLE link is still alive.
+                # Retry the write without dropping and re-establishing the
+                # connection, which would be slow and disruptive.
+                still_connected = (
+                    self._client is not None
+                    and getattr(self._client, "is_connected", False)
                 )
-                # Drop the dead client so _ensure_connected reconnects next loop.
-                self._client = None
+                if still_connected:
+                    logger.warning(
+                        "GATT write error (attempt %d/%d): %s; retrying",
+                        attempt, self._reconnect_attempts, exc,
+                    )
+                else:
+                    logger.warning(
+                        "write failed (attempt %d/%d): %s; reconnecting",
+                        attempt, self._reconnect_attempts, exc,
+                    )
+                    # Drop the dead client so _ensure_connected reconnects next loop.
+                    self._client = None
                 if attempt < self._reconnect_attempts:
                     await asyncio.sleep(self._reconnect_delay)
         raise TransportClosed(

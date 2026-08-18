@@ -80,6 +80,22 @@ class _FakeClient:
         self.writes.append(frame)
 
 
+class _FakeGATTErrorClient:
+    """Simulates transient GATT write errors while keeping the link alive."""
+
+    def __init__(self, fail_writes: int = 0) -> None:
+        self.is_connected = True
+        self.writes: list = []
+        self._fail_writes = fail_writes
+
+    async def write_gatt_char(self, char, frame, response):  # noqa: ANN001
+        if self._fail_writes > 0:
+            self._fail_writes -= 1
+            # Connection stays alive — only a GATT-level rejection.
+            raise RuntimeError("GATT protocol error: Unknown code")
+        self.writes.append(frame)
+
+
 class CentralReconnectTests(unittest.IsolatedAsyncioTestCase):
     def _transport(self, **kwargs):
         from keytalk.ble.central import BleakCentralTransport
@@ -128,6 +144,25 @@ class CentralReconnectTests(unittest.IsolatedAsyncioTestCase):
         await t.send(b"payload")
 
         self.assertEqual(len(connects), 1)
+        self.assertEqual(t._client.writes, [b"payload"])
+
+    async def test_send_retries_gatt_error_without_reconnect(self):
+        # A GATT write error where the link stays alive (is_connected=True)
+        # must be retried on the same connection — no reconnect triggered.
+        t = self._transport(reconnect_attempts=3)
+        t._client = _FakeGATTErrorClient(fail_writes=1)
+        t._prompt_char_obj = object()
+        connects = []
+
+        async def fake_connect():
+            connects.append(1)
+            t._client = _FakeClient()
+            t._prompt_char_obj = object()
+
+        t._connect = fake_connect
+        await t.send(b"payload")
+
+        self.assertEqual(len(connects), 0, "should not reconnect for a GATT error")
         self.assertEqual(t._client.writes, [b"payload"])
 
     async def test_send_raises_when_reconnect_exhausted(self):
