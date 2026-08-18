@@ -12,9 +12,22 @@ import abc
 import asyncio
 import json
 import logging
+import os
+import ssl
 import urllib.error
 import urllib.request
 from typing import AsyncIterator, Optional
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Return an SSL context, loading system CA certs when Python's default bundle is absent."""
+    ctx = ssl.create_default_context()
+    if not ctx.cert_store_stats()["x509"]:
+        for cafile in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+            if os.path.isfile(cafile):
+                ctx.load_verify_locations(cafile)
+                break
+    return ctx
 
 __all__ = [
     "LLMBackend",
@@ -384,7 +397,6 @@ class OpenRouterBackend(LLMBackend):
         *,
         timeout: float = 300.0,
     ) -> None:
-        import os
         self._model = model
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._timeout = timeout
@@ -420,7 +432,7 @@ class OpenRouterBackend(LLMBackend):
             request = urllib.request.Request(url, data=body, headers=headers)
             try:
                 logger.debug("Sending request to OpenRouter at %s", url)
-                with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                with urllib.request.urlopen(request, timeout=self._timeout, context=_ssl_context()) as response:
                     logger.info("Connected to OpenRouter, streaming response")
                     for raw_line in response:
                         loop.call_soon_threadsafe(queue.put_nowait, raw_line)
@@ -486,7 +498,7 @@ class OpenRouterBackend(LLMBackend):
                 headers={"Authorization": f"Bearer {self._api_key}"},
             )
             try:
-                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+                with urllib.request.urlopen(request, timeout=self._timeout, context=_ssl_context()) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.URLError as exc:
                 return OpenRouterError(f"cannot reach OpenRouter: {exc}")
