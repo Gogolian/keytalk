@@ -21,6 +21,7 @@ from typing import List, Optional
 from .backends import OllamaBackend, LMStudioBackend
 from .consumer import ConsumerClient
 from .host import HostService
+from .modes import profile_for_mode  # still used by _run_host
 from .server import DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_PORT, OllamaBridgeServer
 
 
@@ -54,6 +55,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "this if large agent prompts overflow the model's default context",
     )
     host.add_argument("--name", default="keytalk", help="advertised BLE name")
+    host.add_argument(
+        "--mode",
+        default="auto",
+        help="transfer mode: auto (default), legacy, fast_gatt, l2cap_coc, rfcomm",
+    )
     host.add_argument(
         "--verbose",
         action="store_true",
@@ -100,6 +106,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="disable zlib compression of prompts (compression is enabled by "
         "default and typically reduces transmission time by 60-80%% for text)",
     )
+    consume.add_argument(
+        "--mode",
+        default="auto",
+        help="transfer mode: auto (default), legacy, fast_gatt, l2cap_coc, rfcomm",
+    )
 
     scan = sub.add_parser("scan", help="discover nearby keytalk hosts")
     scan.add_argument(
@@ -109,6 +120,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--simple",
         action="store_true",
         help="output just addresses, one per line",
+    )
+    scan.add_argument(
+        "--classic",
+        action="store_true",
+        help="discover Bluetooth Classic (RFCOMM/SPP) hosts instead of BLE hosts",
     )
     return parser
 
@@ -134,8 +150,9 @@ async def _run_host(args: argparse.Namespace) -> int:
         )
         backend_info = f"Ollama: {args.ollama_host}"
     
-    transport = BlessPeripheralTransport(name=args.name)
-    host = HostService(transport, backend)
+    transport = BlessPeripheralTransport(name=args.name, supported_modes=["legacy"])
+    profile = profile_for_mode(args.mode)
+    host = HostService(transport, backend, profile=profile)
     await host.start()
     print(f"\nkeytalk host ready!\n"
           f"  Advertising as: {args.name!r}\n"
@@ -166,7 +183,8 @@ async def _run_consume(args: argparse.Namespace) -> int:
 
     transport = BleakCentralTransport(args.address)
     client = ConsumerClient(
-        transport, 
+        transport,
+        requested_mode=args.mode,
         timeout=args.timeout,
         compress_prompts=not args.no_compress,
     )
@@ -222,7 +240,27 @@ async def _serve_consume(
     return 0
 
 
+async def _run_scan_classic(args: argparse.Namespace) -> int:
+    """Discover Bluetooth Classic / RFCOMM hosts (Phase 4 — platform skeletons)."""
+    import sys
+    print(
+        "keytalk scan --classic: Bluetooth Classic discovery is not yet implemented "
+        "on this platform.\n"
+        "  Linux:   requires PyBluez or BlueZ HCI inquiry (coming in Phase 4).\n"
+        "  macOS:   requires IOBluetooth via pyobjc (coming in Phase 4).\n"
+        "  Windows: requires WinSock Bluetooth inquiry (coming in Phase 4).\n"
+        "\nFalling back to BLE scan…",
+        file=sys.stderr,
+    )
+    # Temporarily delegate to BLE scan until Classic inquiry is implemented.
+    args.classic = False
+    return await _run_scan(args)
+
+
 async def _run_scan(args: argparse.Namespace) -> int:
+    if getattr(args, "classic", False):
+        return await _run_scan_classic(args)
+
     from .ble.central import discover_hosts
 
     devices = await discover_hosts(timeout=args.timeout)

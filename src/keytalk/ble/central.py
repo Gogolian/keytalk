@@ -11,11 +11,12 @@ works without it installed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from ..transport import Transport, TransportClosed
-from .constants import PROMPT_CHAR_UUID, RESPONSE_CHAR_UUID, SERVICE_UUID
+from .constants import CAPS_CHAR_UUID, L2CAP_PSM_CHAR_UUID, PROMPT_CHAR_UUID, RESPONSE_CHAR_UUID, SERVICE_UUID
 
 __all__ = ["BleakCentralTransport", "discover_hosts"]
 
@@ -60,6 +61,8 @@ class BleakCentralTransport(Transport):
         service_uuid: str = SERVICE_UUID,
         prompt_char: str = PROMPT_CHAR_UUID,
         response_char: str = RESPONSE_CHAR_UUID,
+        caps_char: str = CAPS_CHAR_UUID,
+        l2cap_psm_char: str = L2CAP_PSM_CHAR_UUID,
         write_with_response: bool = True,
         reconnect_attempts: int = 5,
         reconnect_delay: float = 1.0,
@@ -69,12 +72,16 @@ class BleakCentralTransport(Transport):
         self._service_uuid = service_uuid
         self._prompt_char = prompt_char
         self._response_char = response_char
+        self._caps_char = caps_char
+        self._l2cap_psm_char = l2cap_psm_char
         self._write_with_response = write_with_response
         self._reconnect_attempts = reconnect_attempts
         self._reconnect_delay = reconnect_delay
         self._client = None  # type: ignore[assignment]
         self._prompt_char_obj = None  # type: ignore[assignment]
         self._response_char_obj = None  # type: ignore[assignment]
+        self._caps_char_obj = None  # type: ignore[assignment]  # None on old hosts
+        self._l2cap_psm_char_obj = None  # type: ignore[assignment]  # None when absent
         self._closed = False
         self._reconnect_lock = asyncio.Lock()
 
@@ -141,6 +148,16 @@ class BleakCentralTransport(Transport):
         self._prompt_char_obj = max(writable_prompts, key=lambda c: c.handle)
         self._response_char_obj = max(response_chars, key=lambda c: c.handle)
 
+        # CAPS characteristic is optional (absent on pre-Phase-1 hosts).
+        caps_chars = [c for c in service.characteristics if c.uuid == self._caps_char]
+        self._caps_char_obj = max(caps_chars, key=lambda c: c.handle) if caps_chars else None
+        if self._caps_char_obj is None:
+            logger.debug("Host has no CAPS characteristic — will use legacy mode")
+
+        # L2CAP PSM characteristic is optional (absent on non-L2CAP hosts).
+        psm_chars = [c for c in service.characteristics if c.uuid == self._l2cap_psm_char]
+        self._l2cap_psm_char_obj = max(psm_chars, key=lambda c: c.handle) if psm_chars else None
+
         logger.info(
             "Using prompt char handle=%s, response char handle=%s",
             self._prompt_char_obj.handle, self._response_char_obj.handle,
@@ -204,6 +221,54 @@ class BleakCentralTransport(Transport):
             raise TransportClosed(
                 f"BLE central could not reconnect to {self._address}: {last_exc}"
             )
+
+    # -- capability hooks -----------------------------------------------------
+
+    async def read_caps(self) -> Optional[List[str]]:
+        """Read and decode the host's CAPS characteristic.
+
+        Returns a list of mode strings, or None if the characteristic is absent
+        (pre-Phase-1 host).
+        """
+        if self._caps_char_obj is None:
+            return None
+        try:
+            raw = await self._client.read_gatt_char(self._caps_char_obj)
+            modes: List[str] = json.loads(bytes(raw).decode())
+            logger.info("Host CAPS: %s", modes)
+            return modes
+        except Exception as exc:  # pragma: no cover - network / parse errors
+            logger.warning("Failed to read CAPS characteristic: %s; using legacy", exc)
+            return None
+
+    @property
+    def mtu_size(self) -> int:
+        if self._client is not None and hasattr(self._client, "mtu_size"):
+            return self._client.mtu_size
+        from ..protocol import DEFAULT_ATT_MTU
+        return DEFAULT_ATT_MTU
+
+    def configure_write_mode(self, write_with_response: bool) -> None:
+        self._write_with_response = write_with_response
+        logger.debug("write-with-response set to %s", write_with_response)
+
+    async def read_l2cap_psm(self) -> Optional[int]:
+        """Read the host's L2CAP LE PSM from the GATT characteristic.
+
+        Returns the PSM as an integer, or None if the characteristic is absent
+        (host does not support L2CAP_COC mode).
+        """
+        if self._l2cap_psm_char_obj is None:
+            return None
+        try:
+            import struct as _struct
+            raw = await self._client.read_gatt_char(self._l2cap_psm_char_obj)
+            (psm,) = _struct.unpack_from("<H", bytes(raw))
+            logger.info("Host L2CAP PSM: %d", psm)
+            return psm
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to read L2CAP PSM characteristic: %s", exc)
+            return None
 
     async def send(self, frame: bytes) -> None:
         logger.debug("Sending %d bytes to host", len(frame))

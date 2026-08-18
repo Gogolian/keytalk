@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import zlib
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import Dict, List, Optional
@@ -38,6 +39,7 @@ __all__ = [
     "PROTOCOL_VERSION",
     "HEADER_SIZE",
     "DEFAULT_ATT_MTU",
+    "CHECKSUM_SIZE",
     "MessageType",
     "Flags",
     "Frame",
@@ -48,8 +50,11 @@ __all__ = [
     "Reassembler",
     "FrameStreamEncoder",
     "compute_message_checksum",
+    "compute_crc32",
     "encode_delta_payload",
     "decode_delta_payload",
+    "encode_select_payload",
+    "decode_select_payload",
 ]
 
 PROTOCOL_VERSION = 1
@@ -76,6 +81,11 @@ class MessageType(IntEnum):
     ACK = 5
     LIST_MODELS = 6
     DELTA_PROMPT = 7  # Incremental prompt with checksum reference
+    # Phase 1 — capability handshake
+    HELLO = 8    # consumer → host: initiate handshake (reserved, not yet sent)
+    CAPS = 9     # host → consumer: capability advertisement
+    SELECT = 10  # consumer → host: select a transfer mode
+    NAK = 11     # either direction: reject / signal mismatch (Phase 2+)
 
 
 class Flags(IntFlag):
@@ -85,7 +95,8 @@ class Flags(IntFlag):
     START = 1
     END = 2
     COMPRESSED = 4  # Payload is zlib-compressed
-    DELTA = 8  # Message is a delta (prefix + new content)
+    DELTA = 8       # Message is a delta (prefix + new content)
+    CHECKSUM = 16   # END frame carries a 4-byte CRC32 trailer after the payload
 
 
 class ProtocolError(Exception):
@@ -169,7 +180,7 @@ class Frame:
             raise ProtocolError(f"unknown message type: {raw_type}") from exc
         # Flags is an IntFlag; reject bits we do not understand so that a
         # corrupted byte does not silently look like a valid boundary marker.
-        known = int(Flags.START | Flags.END | Flags.COMPRESSED | Flags.DELTA)
+        known = int(Flags.START | Flags.END | Flags.COMPRESSED | Flags.DELTA | Flags.CHECKSUM)
         if raw_flags & ~known:
             raise ProtocolError(f"unknown flag bits set: {raw_flags:#04x}")
         return cls(
@@ -194,25 +205,44 @@ class CompleteMessage:
         return self.payload.decode(encoding)
 
 
+# CRC32 trailer appended to the END frame payload when Flags.CHECKSUM is set.
+_CRC_STRUCT = struct.Struct(">I")
+CHECKSUM_SIZE = _CRC_STRUCT.size  # 4 bytes
+
+
+def compute_crc32(data: bytes) -> int:
+    """Return the IEEE CRC32 of *data* as an unsigned 32-bit integer."""
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
 def chunk_message(
     msg_type: MessageType,
     message_id: int,
     payload: bytes,
     max_payload_size: int,
+    *,
+    checksum: bool = False,
 ) -> List[Frame]:
     """Split ``payload`` into an ordered list of frames.
 
     The first frame carries ``START`` and the last carries ``END``.  An empty
-    payload yields exactly one frame with both flags set.
+    payload yields exactly one frame with both flags set.  When ``checksum``
+    is ``True``, a 4-byte CRC32 trailer is appended to the last frame's payload
+    and the ``CHECKSUM`` flag is set on that frame; the :class:`Reassembler`
+    verifies the trailer and strips it before returning the message.
     """
 
     if max_payload_size <= 0:
         raise ValueError("max_payload_size must be positive")
 
+    wire_payload = payload
+    if checksum:
+        wire_payload = payload + _CRC_STRUCT.pack(compute_crc32(payload))
+
     # Always emit at least one frame, even for an empty payload.
     pieces: List[bytes] = [
-        payload[i : i + max_payload_size]
-        for i in range(0, len(payload), max_payload_size)
+        wire_payload[i : i + max_payload_size]
+        for i in range(0, len(wire_payload), max_payload_size)
     ] or [b""]
 
     last = len(pieces) - 1
@@ -229,6 +259,8 @@ def chunk_message(
             flags |= Flags.START
         if seq == last:
             flags |= Flags.END
+            if checksum:
+                flags |= Flags.CHECKSUM
         frames.append(
             Frame(
                 msg_type=msg_type,
@@ -244,13 +276,14 @@ def chunk_message(
 class _Buffer:
     """Accumulates frames belonging to a single in-flight message."""
 
-    __slots__ = ("msg_type", "chunks", "next_seq", "compressed")
+    __slots__ = ("msg_type", "chunks", "next_seq", "compressed", "has_checksum")
 
     def __init__(self, msg_type: MessageType, compressed: bool = False) -> None:
         self.msg_type = msg_type
         self.chunks: List[bytes] = []
         self.next_seq = 0
         self.compressed = compressed
+        self.has_checksum = False
 
 
 class Reassembler:
@@ -294,11 +327,28 @@ class Reassembler:
         buf.next_seq += 1
 
         if frame.is_end:
+            if bool(frame.flags & Flags.CHECKSUM):
+                buf.has_checksum = True
             del self._buffers[frame.message_id]
             payload = b"".join(buf.chunks)
-            # Decompress if the START frame had the COMPRESSED flag
+            # Verify and strip the CRC32 trailer before decompression.
+            if buf.has_checksum:
+                if len(payload) < CHECKSUM_SIZE:
+                    raise ProtocolError(
+                        f"CHECKSUM flag set on message {frame.message_id} "
+                        "but payload is too short to contain the CRC trailer"
+                    )
+                expected_crc, = _CRC_STRUCT.unpack(payload[-CHECKSUM_SIZE:])
+                actual_data = payload[:-CHECKSUM_SIZE]
+                computed_crc = compute_crc32(actual_data)
+                if computed_crc != expected_crc:
+                    raise ProtocolError(
+                        f"CRC32 mismatch for message {frame.message_id}: "
+                        f"expected {expected_crc:#010x}, got {computed_crc:#010x}"
+                    )
+                payload = actual_data
+            # Decompress if the START frame had the COMPRESSED flag.
             if buf.compressed:
-                import zlib
                 try:
                     payload = zlib.decompress(payload)
                 except zlib.error as exc:
@@ -342,16 +392,20 @@ class FrameStreamEncoder:
         msg_type: MessageType,
         message_id: int,
         max_payload_size: int,
+        *,
+        checksum: bool = False,
     ) -> None:
         if max_payload_size <= 0:
             raise ValueError("max_payload_size must be positive")
         self._msg_type = msg_type
         self._message_id = message_id
         self._max = max_payload_size
+        self._use_checksum = checksum
         self._buf = bytearray()
         self._seq = 0
         self._started = False
         self._finished = False
+        self._running_crc = 0  # updated as each payload chunk is emitted
 
     @property
     def next_seq(self) -> int:
@@ -374,11 +428,17 @@ class FrameStreamEncoder:
             flags |= Flags.END
         if self._seq > _MAX_UINT16:
             raise ProtocolError("stream exceeded the 16-bit sequence space")
+        # Update running CRC with this chunk's data (before any trailer).
+        self._running_crc = zlib.crc32(payload, self._running_crc) & 0xFFFFFFFF
+        actual_payload = payload
+        if last and self._use_checksum:
+            flags |= Flags.CHECKSUM
+            actual_payload = payload + _CRC_STRUCT.pack(self._running_crc)
         frame = Frame(
             msg_type=self._msg_type,
             message_id=self._message_id,
             seq=self._seq,
-            payload=payload,
+            payload=actual_payload,
             flags=flags,
         )
         self._seq += 1
@@ -447,3 +507,23 @@ def decode_delta_payload(payload: bytes) -> tuple[str, bytes]:
     checksum = payload[1:1 + checksum_len].decode('utf-8')
     delta_content = payload[1 + checksum_len:]
     return checksum, delta_content
+
+
+# SELECT payload: 1-byte mode_id (uint8) + 2-byte MTU (uint16 big-endian).
+# 3 bytes total — always fits in a single legacy frame.
+_SELECT_STRUCT = struct.Struct(">BH")
+
+
+def encode_select_payload(mode_id: int, mtu: int) -> bytes:
+    """Encode a SELECT frame payload."""
+    return _SELECT_STRUCT.pack(mode_id, mtu)
+
+
+def decode_select_payload(data: bytes) -> tuple[int, int]:
+    """Decode a SELECT frame payload → (mode_id, mtu)."""
+    if len(data) < _SELECT_STRUCT.size:
+        raise ProtocolError(
+            f"SELECT payload too short: {len(data)} bytes, need {_SELECT_STRUCT.size}"
+        )
+    mode_id, mtu = _SELECT_STRUCT.unpack(data[: _SELECT_STRUCT.size])
+    return mode_id, mtu

@@ -17,17 +17,20 @@ import logging
 import zlib
 from typing import AsyncIterator, Dict, List, Optional
 
+from .modes import LEGACY_PROFILE, Mode, ProfileConfig, negotiate_mode, mode_id_for, make_l2cap_coc_profile
 from .protocol import (
     DEFAULT_ATT_MTU,
     Flags,
     Frame,
     MessageType,
     ProtocolError,
+    Reassembler,
     chunk_message,
     max_payload_for_mtu,
     compute_message_checksum,
     encode_delta_payload,
     decode_delta_payload,
+    encode_select_payload,
 )
 from .reliability import make_ack_frame
 from .transport import Transport
@@ -51,17 +54,23 @@ class _PendingRequest:
     a notification is dropped and later retransmitted) are buffered and replayed
     in sequence rather than treated as a fatal error.  Completion is signalled
     with a sentinel so an async iterator terminates cleanly.
+
+    When ``reassemble=True`` (used by FAST_GATT), all frames are fed through a
+    :class:`Reassembler` which handles decompression and CRC32 verification;
+    the decoded payload is emitted as a single chunk once the END frame arrives.
     """
 
     _END = object()
 
-    def __init__(self, message_id: int) -> None:
+    def __init__(self, message_id: int, *, reassemble: bool = False) -> None:
         self.message_id = message_id
         self._queue: "asyncio.Queue[object]" = asyncio.Queue()
         self._next_seq = 0
         self._reorder: Dict[int, Frame] = {}
         self._started = False
         self._done = False
+        self._reassemble = reassemble
+        self._inner: Optional[Reassembler] = Reassembler() if reassemble else None
 
     @property
     def ack_seq(self) -> int:
@@ -107,6 +116,25 @@ class _PendingRequest:
                 return
             self._started = True
 
+        if self._reassemble:
+            # Route through the inner Reassembler for decompression + CRC32.
+            assert self._inner is not None
+            try:
+                result = self._inner.feed(frame)
+            except ProtocolError as exc:
+                self._fail(exc)
+                return
+            if result is not None:
+                if result.msg_type == MessageType.ERROR:
+                    self._queue.put_nowait(("error", result.payload))
+                else:
+                    self._queue.put_nowait(("data", result.payload))
+                self._next_seq += 1  # mirrors legacy END handling
+                self._done = True
+                self._queue.put_nowait(self._END)
+            return
+
+        # Legacy streaming path: emit each frame payload immediately.
         if frame.msg_type == MessageType.ERROR:
             # Error payloads can also span multiple frames; accumulate until END.
             self._queue.put_nowait(("error", frame.payload))
@@ -165,6 +193,8 @@ class ConsumerClient:
         self,
         transport: Transport,
         *,
+        profile: Optional[ProfileConfig] = None,
+        requested_mode: str = "auto",
         mtu: int = DEFAULT_ATT_MTU,
         max_payload_size: Optional[int] = None,
         timeout: float = DEFAULT_TIMEOUT,
@@ -172,6 +202,9 @@ class ConsumerClient:
         enable_delta_messages: bool = True,
     ) -> None:
         self._transport = transport
+        self._profile = profile or LEGACY_PROFILE
+        # If an explicit profile was supplied, skip negotiation.
+        self._requested_mode: Optional[str] = None if profile is not None else requested_mode
         self._max_payload = (
             max_payload_size
             if max_payload_size is not None
@@ -196,6 +229,50 @@ class ConsumerClient:
     async def start(self) -> None:
         self._transport.on_receive(self._on_frame)
         await self._transport.start()
+        await self._negotiate()
+
+    async def _negotiate(self) -> None:
+        """Run the Phase-1 capability handshake, if supported by the transport."""
+        if self._requested_mode is None:
+            return  # explicit profile supplied at construction — skip
+        host_modes = await self._transport.read_caps()
+        new_profile = negotiate_mode(host_modes, self._requested_mode)
+        self._profile = new_profile
+        # For FAST_GATT and L2CAP_COC, size max_payload and switch write mode.
+        if new_profile.mode == Mode.FAST_GATT:
+            mtu = self._transport.mtu_size
+            self._max_payload = max_payload_for_mtu(mtu)
+            self._transport.configure_write_mode(write_with_response=False)
+        elif new_profile.mode == Mode.L2CAP_COC:
+            # PSM read and L2CAP channel open happen at the BLE transport layer;
+            # the transport switch is coordinated by BleakCentralTransport when
+            # running on real hardware.  For in-process tests the L2CAP transport
+            # is wired directly and negotiation is bypassed via profile=.
+            mtu = self._transport.mtu_size
+            self._max_payload = max_payload_for_mtu(mtu)
+            psm = await self._transport.read_l2cap_psm()
+            if psm is not None:
+                logger.info("L2CAP_COC: host PSM=%d (channel open deferred to BLE layer)", psm)
+        elif new_profile.mode == Mode.CLASSIC_RFCOMM:
+            # RFCOMM channel setup happens at the Classic transport layer; for
+            # in-process tests the transport is wired directly via profile=.
+            mtu = self._transport.mtu_size
+            self._max_payload = max_payload_for_mtu(mtu)
+        # Send SELECT so the host knows the agreed mode and the consumer's MTU.
+        mtu = self._transport.mtu_size
+        select_frame = Frame(
+            msg_type=MessageType.SELECT,
+            message_id=0,  # reserved control channel
+            seq=0,
+            payload=encode_select_payload(mode_id_for(new_profile.mode), mtu),
+            flags=Flags.START | Flags.END,
+        )
+        await self._transport.send(select_frame.encode())
+        logger.info(
+            "Negotiated mode: %s (MTU=%d, host caps=%s)",
+            new_profile.mode.value, mtu,
+            host_modes if host_modes is not None else "n/a (legacy host)",
+        )
 
     async def close(self) -> None:
         await self._transport.close()
@@ -217,6 +294,17 @@ class ConsumerClient:
             return
         # The consumer never expects ACK frames itself; ignore defensively.
         if frame.msg_type == MessageType.ACK:
+            return
+        # Control frames (CAPS, SELECT, HELLO, NAK) are not routed to pending
+        # requests; ignore them so unexpected control traffic doesn't surface
+        # as errors after negotiation completes.
+        if frame.msg_type in (
+            MessageType.CAPS,
+            MessageType.SELECT,
+            MessageType.HELLO,
+            MessageType.NAK,
+        ):
+            logger.debug("ignoring control frame type %s", frame.msg_type.name)
             return
         pending = self._pending.get(frame.message_id)
         if pending is None:
@@ -315,6 +403,7 @@ class ConsumerClient:
             message_id,
             payload,
             self._max_payload,
+            checksum=self._profile.mode in (Mode.FAST_GATT, Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM),
         )
         # Mark first frame with appropriate flags
         if frames:
@@ -345,7 +434,10 @@ class ConsumerClient:
         self, payload: bytes, msg_type: MessageType
     ) -> AsyncIterator[str]:
         message_id = self._alloc_id()
-        pending = _PendingRequest(message_id)
+        # FAST_GATT, L2CAP_COC and CLASSIC_RFCOMM send compressed + checksummed bulk
+        # responses; reassemble them as a single payload rather than streaming raw chunks.
+        reassemble = self._profile.mode in (Mode.FAST_GATT, Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM)
+        pending = _PendingRequest(message_id, reassemble=reassemble)
         self._pending[message_id] = pending
         
         # Track the original prompt for history

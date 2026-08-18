@@ -24,6 +24,8 @@ dependencies = []
 consumer = ["bleak>=0.21"]
 host = ["bless>=0.2.6"]
 ble = ["bleak>=0.21", "bless>=0.2.6"]
+# Bluetooth Classic RFCOMM (platform libraries, only needed for --mode rfcomm).
+classic = ["PyBluez>=0.23; sys_platform=='linux'"]
 
 [project.scripts]
 keytalk = "keytalk.cli:main"

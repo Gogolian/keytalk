@@ -15,6 +15,8 @@ import abc
 import asyncio
 from typing import Awaitable, Callable, List, Optional, Tuple
 
+from .protocol import DEFAULT_ATT_MTU
+
 __all__ = ["Transport", "TransportClosed", "InMemoryTransport", "create_loopback"]
 
 ReceiveCallback = Callable[[bytes], Awaitable[None]]
@@ -64,6 +66,43 @@ class Transport(abc.ABC):
     async def __aexit__(self, *exc_info: object) -> None:
         await self.close()
 
+    # -- capability hooks (overridden by BLE transports) ----------------------
+
+    async def read_caps(self) -> Optional[List[str]]:
+        """Return the host's advertised capability list, or None if unavailable.
+
+        The default implementation returns None (pre-Phase-1 host or non-BLE
+        transport) so the consumer falls back to legacy mode transparently.
+        BLE central overrides this to read the CAPS GATT characteristic.
+        """
+        return None
+
+    @property
+    def mtu_size(self) -> int:
+        """Return the negotiated link-layer MTU.
+
+        BLE central overrides this with the value from ``bleak``'s
+        ``client.mtu_size``.  All other transports return the default.
+        """
+        return DEFAULT_ATT_MTU
+
+    def configure_write_mode(self, write_with_response: bool) -> None:
+        """Switch write-with-response on or off for the send path.
+
+        BLE central overrides this to control whether GATT writes request a
+        link-layer ACK.  The default is a no-op (in-memory transport is always
+        reliable).
+        """
+        pass  # no-op for non-BLE transports
+
+    async def read_l2cap_psm(self) -> Optional[int]:
+        """Return the host's L2CAP LE PSM from the GATT characteristic, or None.
+
+        BLE central overrides this to read the L2CAP_PSM characteristic.  The
+        default returns None (non-BLE or pre-Phase-3 transport).
+        """
+        return None
+
 
 class InMemoryTransport(Transport):
     """A loopback transport linked to a peer in the same process.
@@ -71,11 +110,21 @@ class InMemoryTransport(Transport):
     Frames sent here are delivered to the peer's receive callback on the running
     event loop.  Delivery is scheduled via ``call_soon`` so it behaves
     asynchronously, like a real link, rather than re-entrantly.
+
+    ``caps`` simulates the host CAPS characteristic for negotiation tests.
+    Pass a list of mode strings (e.g. ``["legacy", "fast_gatt"]``) to make
+    ``read_caps()`` return that list; leave it as None to simulate an old host.
     """
 
-    def __init__(self, name: str = "") -> None:
+    def __init__(
+        self,
+        name: str = "",
+        *,
+        caps: Optional[List[str]] = None,
+    ) -> None:
         super().__init__()
         self.name = name
+        self._caps = caps
         self._peer: Optional["InMemoryTransport"] = None
         self._closed = False
         #: Every frame this endpoint has sent, in order (handy for assertions).
@@ -84,6 +133,9 @@ class InMemoryTransport(Transport):
 
     def link(self, peer: "InMemoryTransport") -> None:
         self._peer = peer
+
+    async def read_caps(self) -> Optional[List[str]]:
+        return self._caps
 
     async def start(self) -> None:  # noqa: D401 - nothing to do for loopback
         self._closed = False
@@ -118,11 +170,17 @@ class InMemoryTransport(Transport):
 
 def create_loopback(
     names: Tuple[str, str] = ("host", "consumer"),
+    *,
+    consumer_caps: Optional[List[str]] = None,
 ) -> Tuple[InMemoryTransport, InMemoryTransport]:
-    """Create a linked pair of in-memory transports ``(host, consumer)``."""
+    """Create a linked pair of in-memory transports ``(host, consumer)``.
+
+    ``consumer_caps`` is passed to the consumer-side transport's ``caps``
+    parameter to simulate a host that advertises a CAPS characteristic.
+    """
 
     a = InMemoryTransport(names[0])
-    b = InMemoryTransport(names[1])
+    b = InMemoryTransport(names[1], caps=consumer_caps)
     a.link(b)
     b.link(a)
     return a, b

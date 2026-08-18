@@ -17,6 +17,7 @@ import zlib
 from typing import Dict, Optional, Set
 
 from .backends import LLMBackend
+from .modes import LEGACY_PROFILE, Mode, ProfileConfig, make_classic_rfcomm_profile, make_fast_gatt_profile, make_l2cap_coc_profile, mode_for_id, profile_for_mode
 from .protocol import (
     DEFAULT_ATT_MTU,
     FrameStreamEncoder,
@@ -25,9 +26,11 @@ from .protocol import (
     MessageType,
     ProtocolError,
     Reassembler,
+    chunk_message,
     max_payload_for_mtu,
     compute_message_checksum,
     decode_delta_payload,
+    decode_select_payload,
 )
 from .reliability import ReliableSender
 from .transport import Transport
@@ -45,11 +48,13 @@ class HostService:
         transport: Transport,
         backend: LLMBackend,
         *,
+        profile: Optional[ProfileConfig] = None,
         mtu: int = DEFAULT_ATT_MTU,
         max_payload_size: Optional[int] = None,
     ) -> None:
         self._transport = transport
         self._backend = backend
+        self._profile = profile or LEGACY_PROFILE
         self._max_payload = (
             max_payload_size
             if max_payload_size is not None
@@ -61,6 +66,7 @@ class HostService:
         self._tasks: Set["asyncio.Task[None]"] = set()
         self._senders: Dict[int, ReliableSender] = {}
         self._started = False
+        self._negotiated_mtu: int = DEFAULT_ATT_MTU
         # Track conversation history for delta message reconstruction
         self._conversation_history: bytes = b""
         self._history_checksum: str = ""
@@ -109,6 +115,12 @@ class HostService:
                 logger.debug("ACK for unknown message %s", frame.message_id)
             return
 
+        # SELECT arrives before any prompts and configures the mode for this
+        # connection; handle it directly without going through the Reassembler.
+        if frame.msg_type == MessageType.SELECT:
+            self._handle_select(frame)
+            return
+
         try:
             message = self._reassembler.feed(frame)
         except ProtocolError:
@@ -134,6 +146,40 @@ class HostService:
                 "ignoring unexpected message type %s", message.msg_type.name
             )
 
+    def _handle_select(self, frame: Frame) -> None:
+        """Apply the mode selection sent by the consumer."""
+        try:
+            mode_id, reported_mtu = decode_select_payload(frame.payload)
+        except ProtocolError as exc:
+            logger.warning("Ignoring malformed SELECT frame: %s", exc)
+            return
+        try:
+            mode = mode_for_id(mode_id)
+        except ValueError:
+            logger.warning("SELECT: unknown mode_id %d — staying on legacy", mode_id)
+            return
+        try:
+            if mode == Mode.FAST_GATT:
+                new_profile = make_fast_gatt_profile(reported_mtu)
+            elif mode == Mode.L2CAP_COC:
+                new_profile = make_l2cap_coc_profile(reported_mtu)
+            elif mode == Mode.CLASSIC_RFCOMM:
+                new_profile = make_classic_rfcomm_profile(reported_mtu)
+            else:
+                new_profile = profile_for_mode(mode.value)
+        except ValueError as exc:
+            logger.warning("SELECT: mode %r not implemented — staying on legacy: %s", mode.value, exc)
+            return
+        self._profile = new_profile
+        self._negotiated_mtu = reported_mtu
+        # Only resize response frames for modes that exploit larger MTUs.
+        if new_profile.mode != Mode.LEGACY:
+            self._max_payload = max_payload_for_mtu(reported_mtu)
+        logger.info(
+            "Mode negotiated: %s (consumer reported MTU=%d, max_payload=%d)",
+            new_profile.mode.value, reported_mtu, self._max_payload,
+        )
+
     def _spawn(self, coro: "asyncio.coroutines") -> None:
         task = asyncio.ensure_future(coro)
         self._tasks.add(task)
@@ -143,6 +189,16 @@ class HostService:
 
     async def _handle_prompt(self, message_id: int, prompt: str) -> None:
         logger.info("Starting to handle prompt %s (%d chars)", message_id, len(prompt))
+
+        if self._profile.mode == Mode.FAST_GATT:
+            await self._handle_prompt_fast_gatt(message_id, prompt)
+        elif self._profile.mode in (Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM):
+            await self._handle_prompt_stream(message_id, prompt)
+        else:
+            await self._handle_prompt_legacy(message_id, prompt)
+
+    async def _handle_prompt_legacy(self, message_id: int, prompt: str) -> None:
+        """Stream response frames one token at a time (LEGACY / default path)."""
         encoder = FrameStreamEncoder(
             MessageType.RESPONSE, message_id, self._max_payload
         )
@@ -169,6 +225,142 @@ class HostService:
             raise
         except Exception as exc:  # noqa: BLE001 - report any backend failure
             logger.exception("backend failed for message %s", message_id)
+            await self._send_error(sender, encoder, message_id, str(exc))
+        finally:
+            sender.close()
+            self._senders.pop(message_id, None)
+
+    async def _handle_prompt_stream(self, message_id: int, prompt: str) -> None:
+        """Collect full response, compress, CRC32, send directly (L2CAP_COC / RFCOMM path).
+
+        Both L2CAP COC and RFCOMM provide reliable ordered streams, so the
+        Go-Back-N ``ReliableSender`` is not needed; frames go to the transport directly.
+        """
+        encoder = FrameStreamEncoder(MessageType.RESPONSE, message_id, self._max_payload)
+        try:
+            parts: list[bytes] = []
+            async for fragment in self._backend.generate(prompt):
+                if fragment:
+                    parts.append(fragment.encode("utf-8"))
+            full_response = b"".join(parts)
+
+            compressed = zlib.compress(full_response, level=6)
+            if len(compressed) >= len(full_response):
+                wire_payload = full_response
+                use_compressed_flag = False
+            else:
+                wire_payload = compressed
+                use_compressed_flag = True
+
+            frames = chunk_message(
+                MessageType.RESPONSE,
+                message_id,
+                wire_payload,
+                self._max_payload,
+                checksum=True,
+            )
+            if use_compressed_flag and frames:
+                f0 = frames[0]
+                frames[0] = Frame(
+                    msg_type=f0.msg_type,
+                    message_id=f0.message_id,
+                    seq=f0.seq,
+                    payload=f0.payload,
+                    flags=f0.flags | Flags.COMPRESSED,
+                    version=f0.version,
+                )
+            for frame in frames:
+                await self._transport.send(frame.encode())
+            logger.info(
+                "Completed %s prompt %s (%d raw bytes → %d wire bytes, %d frames)",
+                self._profile.mode.value,
+                message_id, len(full_response), len(wire_payload), len(frames),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("backend failed for message %s (%s)", message_id, self._profile.mode.value)
+            # Send an error message directly without a ReliableSender.
+            payload = str(exc).encode("utf-8") or b"backend error"
+            pieces = [
+                payload[i : i + self._max_payload]
+                for i in range(0, len(payload), self._max_payload)
+            ] or [b""]
+            for idx, piece in enumerate(pieces):
+                flags = Flags.NONE
+                if idx == 0 and not encoder.has_started:
+                    flags |= Flags.START
+                if idx == len(pieces) - 1:
+                    flags |= Flags.END
+                await self._transport.send(
+                    Frame(
+                        msg_type=MessageType.ERROR,
+                        message_id=message_id,
+                        seq=encoder.next_seq + idx,
+                        payload=piece,
+                        flags=flags,
+                    ).encode()
+                )
+
+    # Keep the old name as an alias so existing test suites that reference it directly still pass.
+    _handle_prompt_l2cap_coc = _handle_prompt_stream
+
+    async def _handle_prompt_fast_gatt(self, message_id: int, prompt: str) -> None:
+        """Collect full response, compress, checksum, then send (FAST_GATT path)."""
+        sender = ReliableSender(
+            self._transport.send,
+            window=self._profile.reliability_window,
+        )
+        self._senders[message_id] = sender
+        sender.start()
+        # Dummy encoder only used for _send_error path.
+        encoder = FrameStreamEncoder(MessageType.RESPONSE, message_id, self._max_payload)
+        try:
+            parts: list[bytes] = []
+            async for fragment in self._backend.generate(prompt):
+                if fragment:
+                    parts.append(fragment.encode("utf-8"))
+            full_response = b"".join(parts)
+
+            # Compress the full response.
+            compressed = zlib.compress(full_response, level=6)
+            if len(compressed) >= len(full_response):
+                # Not worth it — send raw.
+                wire_payload = full_response
+                use_compressed_flag = False
+            else:
+                wire_payload = compressed
+                use_compressed_flag = True
+
+            frames = chunk_message(
+                MessageType.RESPONSE,
+                message_id,
+                wire_payload,
+                self._max_payload,
+                checksum=True,
+            )
+            # Set COMPRESSED on the START frame if the payload is compressed.
+            if use_compressed_flag and frames:
+                f0 = frames[0]
+                frames[0] = Frame(
+                    msg_type=f0.msg_type,
+                    message_id=f0.message_id,
+                    seq=f0.seq,
+                    payload=f0.payload,
+                    flags=f0.flags | Flags.COMPRESSED,
+                    version=f0.version,
+                )
+            for frame in frames:
+                await sender.send_frame(frame)
+            await sender.drain()
+            logger.info(
+                "Completed fast_gatt prompt %s (%d raw bytes → %d wire bytes, %d frames)",
+                message_id, len(full_response), len(wire_payload), len(frames),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("backend failed for message %s (fast_gatt)", message_id)
             await self._send_error(sender, encoder, message_id, str(exc))
         finally:
             sender.close()

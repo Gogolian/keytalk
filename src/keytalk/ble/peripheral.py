@@ -13,12 +13,15 @@ lazily so keytalk works without it installed.
 
 from __future__ import annotations
 
+import json
 import asyncio
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from ..transport import Transport, TransportClosed
 from .constants import (
+    CAPS_CHAR_UUID,
+    L2CAP_PSM_CHAR_UUID,
     PROMPT_CHAR_UUID,
     RESPONSE_CHAR_UUID,
     SERVICE_NAME,
@@ -52,21 +55,27 @@ class BlessPeripheralTransport(Transport):
         service_uuid: str = SERVICE_UUID,
         prompt_char: str = PROMPT_CHAR_UUID,
         response_char: str = RESPONSE_CHAR_UUID,
+        caps_char: str = CAPS_CHAR_UUID,
+        l2cap_psm_char: str = L2CAP_PSM_CHAR_UUID,
+        supported_modes: Optional[List[str]] = None,
         notify_interval: float = 0.02,
+        l2cap_psm: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._name = name
         self._service_uuid = service_uuid
         self._prompt_char = prompt_char
         self._response_char = response_char
+        self._caps_char = caps_char
+        self._l2cap_psm_char = l2cap_psm_char
+        # Modes to advertise in the CAPS characteristic; always includes legacy.
+        self._supported_modes: List[str] = supported_modes if supported_modes is not None else ["legacy"]
         self._server = None  # type: ignore[assignment]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Minimum spacing between consecutive notifications. CoreBluetooth (and
-        # BlueZ) transmit notifications asynchronously; if we overwrite the
-        # characteristic value too quickly the previous notification can be
-        # dropped, which shows up on the consumer as an out-of-order frame.
         self._notify_interval = notify_interval
         self._send_lock = asyncio.Lock()
+        # PSM advertised when l2cap_coc is in supported_modes; None means absent.
+        self._l2cap_psm: Optional[int] = l2cap_psm
 
     async def start(self) -> None:
         _import_bless()
@@ -120,6 +129,33 @@ class BlessPeripheralTransport(Transport):
             None,
             response_perms,
         )
+
+        # CAPS characteristic: read-only, static list of supported modes.
+        caps_value = bytearray(json.dumps(self._supported_modes).encode())
+        caps_props = GATTCharacteristicProperties.read
+        caps_perms = GATTAttributePermissions.readable
+        await server.add_new_characteristic(
+            self._service_uuid,
+            self._caps_char,
+            caps_props,
+            caps_value,
+            caps_perms,
+        )
+
+        # L2CAP PSM characteristic: present only when l2cap_coc is supported.
+        if "l2cap_coc" in self._supported_modes and self._l2cap_psm is not None:
+            import struct as _struct
+            psm_value = bytearray(_struct.pack("<H", self._l2cap_psm))
+            psm_props = GATTCharacteristicProperties.read
+            psm_perms = GATTAttributePermissions.readable
+            await server.add_new_characteristic(
+                self._service_uuid,
+                self._l2cap_psm_char,
+                psm_props,
+                psm_value,
+                psm_perms,
+            )
+            logger.info("Advertising L2CAP PSM=%d via GATT characteristic", self._l2cap_psm)
 
         await server.start()
         self._server = server
