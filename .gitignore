@@ -8,3 +8,5 @@ dist/
 venv/
 .mypy_cache/
 .pytest_cache/
+tmp/
+.ailoc2-metrics/
