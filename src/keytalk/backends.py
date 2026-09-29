@@ -41,6 +41,10 @@ __all__ = [
     "LMStudioError",
     "OpenRouterBackend",
     "OpenRouterError",
+    "LlamaCppBackend",
+    "LlamaCppError",
+    "TokenStream",
+    "messages_to_prompt",
 ]
 
 logger = logging.getLogger("keytalk.backends")
@@ -541,3 +545,261 @@ class OpenRouterBackend(LLMBackend):
                 if name:
                     names.append(str(name))
         return sorted(names)
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+class TokenStream:
+    """Async text stream that captures server metadata when the stream ends.
+
+    ``llama.cpp`` attaches a ``timings`` object (including MTP
+    ``draft_n``/``draft_n_accepted`` acceptance stats) to the final streaming
+    chunk.  A plain async generator cannot carry that out-of-band, so backends
+    that have metadata return this wrapper instead: iterate it like any async
+    iterator, then read :attr:`timings`.
+    """
+
+    def __init__(self, gen: AsyncIterator[str], meta: dict) -> None:
+        self._gen = gen
+        self._meta = meta
+
+    def __aiter__(self) -> "TokenStream":
+        return self
+
+    async def __anext__(self) -> str:
+        return await self._gen.__anext__()
+
+    @property
+    def timings(self) -> Optional[dict]:
+        """Generation timings reported by the server, once available."""
+
+        value = self._meta.get("timings")
+        return value if isinstance(value, dict) else None
+
+
+def messages_to_prompt(messages: list) -> str:
+    """Render chat messages into a plain transcript for prompt-only backends.
+
+    Backends with native chat support (e.g. :class:`LlamaCppBackend`) pass the
+    structured messages straight through so the model's own chat template is
+    used; this is only the fallback for backends that accept a single prompt.
+    """
+
+    systems: list = []
+    turns: list = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "user")).strip().lower()
+        content = message.get("content", "")
+        if content is None:
+            content = ""
+        content = str(content)
+        if role == "system":
+            if content:
+                systems.append(content)
+        elif role == "assistant":
+            turns.append(f"Assistant: {content}")
+        else:  # treat anything else (user/tool/...) as a user turn
+            turns.append(f"User: {content}")
+    parts: list = []
+    if systems:
+        parts.append("\n".join(systems))
+    parts.extend(turns)
+    body = "\n".join(parts)
+    if body:
+        return f"{body}\nAssistant:"
+    return "Assistant:"
+
+
+class LlamaCppError(Exception):
+    """Raised when the llama.cpp server cannot be reached or errors out."""
+
+
+class LlamaCppBackend(LLMBackend):
+    """Stream completions from a ``llama-server`` (llama.cpp) instance.
+
+    Wire formats are taken from llama.cpp's ``tools/server`` (server-task.cpp):
+
+    * ``POST /completions`` (native): SSE ``data: {json}`` lines with top-level
+      ``content`` and ``stop`` fields; the final chunk carries ``timings``.
+    * ``POST /v1/chat/completions`` (OpenAI-style): SSE chunks with
+      ``choices[0].delta.content``; the final chunk carries ``timings`` and the
+      stream ends with ``data: [DONE]``.  The server renders the model's own
+      chat template (``--jinja``), so structured messages are passed through
+      untouched.
+    * ``GET /v1/models``: ``{"models": [...], "object": "list", "data": [...]}``.
+
+    Both streaming endpoints frame every JSON object as ``data: ...\\n\\n``.
+    ``reasoning_content`` deltas (deepseek thinking format) are skipped; the
+    content stream carries assistant output only.
+    """
+
+    def __init__(
+        self,
+        model: str = "",
+        host: str = "http://127.0.0.1:8080",
+        *,
+        timeout: float = 300.0,
+        n_predict: int = 0,
+    ) -> None:
+        self._model = model
+        self._host = host.rstrip("/")
+        self._timeout = timeout
+        self._n_predict = n_predict
+
+    # -- public API -----------------------------------------------------------
+
+    def generate(self, prompt: str) -> TokenStream:
+        """Stream a plain-text completion from the native ``/completions``."""
+
+        body: dict = {"prompt": prompt, "stream": True}
+        if self._n_predict:
+            body["n_predict"] = self._n_predict
+        meta: dict = {}
+        return TokenStream(self._run(body, "/completions", meta, chat=False), meta)
+
+    def generate_messages(self, messages: list, **params) -> TokenStream:
+        """Stream a chat completion from ``/v1/chat/completions``.
+
+        ``messages`` are passed through as-is so llama.cpp's Jinja chat
+        template (including ``preserve_thinking`` etc.) does the rendering.
+        Extra keyword arguments (``temperature``, ``max_tokens``, ...) are
+        merged into the request body.
+        """
+
+        body: dict = {"messages": list(messages), "stream": True}
+        if self._model:
+            body["model"] = self._model
+        body.update(params)
+        meta: dict = {}
+        return TokenStream(self._run(body, "/v1/chat/completions", meta, chat=True), meta)
+
+    async def list_models(self) -> list[str]:
+        loop = asyncio.get_running_loop()
+
+        def worker() -> object:
+            url = f"{self._host}/v1/models"
+            request = urllib.request.Request(url, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return LlamaCppError(_http_error_text(exc))
+            except urllib.error.URLError as exc:
+                return LlamaCppError(f"cannot reach llama-server: {exc}")
+            except Exception as exc:  # noqa: BLE001 - defensive
+                return exc
+
+        result = await loop.run_in_executor(None, worker)
+        if isinstance(result, Exception):
+            raise result
+        # The endpoint reports both an OAI-style "data" and an Ollama-style
+        # "models" array; prefer "data", fall back to "models".
+        names = [
+            str(entry.get("id"))
+            for entry in result.get("data", [])
+            if isinstance(entry, dict) and entry.get("id")
+        ]
+        if not names:
+            names = [
+                str(entry.get("name"))
+                for entry in result.get("models", [])
+                if isinstance(entry, dict) and entry.get("name")
+            ]
+        return names
+
+    # -- internals ------------------------------------------------------------
+
+    async def _run(self, body: dict, path: str, meta: dict, *, chat: bool) -> AsyncIterator[str]:
+        loop = asyncio.get_running_loop()
+        queue: "asyncio.Queue[object]" = asyncio.Queue()
+        done = object()
+        url = f"{self._host}{path}"
+        payload = json.dumps(body).encode("utf-8")
+
+        def worker() -> None:
+            request = urllib.request.Request(
+                url, data=payload, headers={"Content-Type": "application/json"}
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                    for raw_line in response:
+                        loop.call_soon_threadsafe(queue.put_nowait, raw_line)
+            except urllib.error.HTTPError as exc:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, LlamaCppError(_http_error_text(exc))
+                )
+            except urllib.error.URLError as exc:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    LlamaCppError(f"cannot reach llama-server: {exc}"),
+                )
+            except Exception as exc:  # noqa: BLE001 - defensive
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, done)
+
+        worker_future = loop.run_in_executor(None, worker)
+        try:
+            while True:
+                item = await queue.get()
+                if item is done:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                chunk = _parse_sse_json(bytes(item))
+                if chunk is None:
+                    continue
+                if isinstance(chunk.get("error"), (dict, str)):
+                    raise LlamaCppError(str(chunk["error"]))
+                timings = chunk.get("timings")
+                if isinstance(timings, dict):
+                    meta["timings"] = timings
+                text = _chunk_content(chunk, chat=chat)
+                if text:
+                    yield text
+        finally:
+            await worker_future
+
+
+def _http_error_text(exc: "urllib.error.HTTPError") -> str:
+    try:
+        body = exc.read().decode("utf-8", "replace")
+        obj = json.loads(body)
+        if isinstance(obj, dict) and "error" in obj:
+            return str(obj["error"])
+        return body or str(exc)
+    except Exception:  # noqa: BLE001 - fall back to the raw error
+        return str(exc)
+
+
+def _parse_sse_json(line: bytes) -> Optional[dict]:
+    """Parse one SSE ``data: {json}`` line (llama.cpp frames everything as SSE)."""
+
+    line = line.strip()
+    if not line or line == b"data: [DONE]" or line.startswith(b":"):
+        return None  # [DONE] terminator and SSE ping lines
+    if line.startswith(b"data: "):
+        line = line[6:]
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _chunk_content(chunk: dict, *, chat: bool) -> Optional[str]:
+    """Extract streamed text from a native or OpenAI-style chunk."""
+
+    if chat:
+        choices = chunk.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return None
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+    else:
+        content = chunk.get("content")
+    return content if isinstance(content, str) and content else None

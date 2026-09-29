@@ -139,6 +139,25 @@ class ReliableSender:
         if not self._inflight:
             self._drained_event.set()
 
+    def nudge(self) -> None:
+        """Retransmit every unacked frame promptly and reset retry budgets.
+
+        Used when the peer asks for a RESUME after a link drop: whatever
+        arrived while we were disconnected is re-sent immediately instead of
+        waiting for the retransmit timer, and frames about to be declared dead
+        get a fresh set of attempts.
+        """
+
+        for entry in self._inflight.values():
+            entry.retries = 0
+            entry.sent_at = 0.0  # expired: the next retransmit tick resends
+
+    @property
+    def alive(self) -> bool:
+        """Whether the sender has not failed."""
+
+        return self._failed is None
+
     async def drain(self) -> None:
         """Wait until every sent frame has been acknowledged."""
 

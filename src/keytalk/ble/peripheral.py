@@ -58,7 +58,7 @@ class BlessPeripheralTransport(Transport):
         caps_char: str = CAPS_CHAR_UUID,
         l2cap_psm_char: str = L2CAP_PSM_CHAR_UUID,
         supported_modes: Optional[List[str]] = None,
-        notify_interval: float = 0.02,
+        notify_interval: float = 0.004,
         l2cap_psm: Optional[int] = None,
     ) -> None:
         super().__init__()
@@ -97,7 +97,9 @@ class BlessPeripheralTransport(Transport):
             data = bytes(value)
             logger.debug("✓ Consumer sent %d bytes", len(data))
             assert self._loop is not None
-            asyncio.run_coroutine_threadsafe(self._dispatch(data), self._loop)
+            # bless may call back from another thread; hop onto our loop.  The
+            # transport's ordered dispatch queue preserves arrival order.
+            self._loop.call_soon_threadsafe(self._dispatch, data)
 
         server.read_request_func = _on_read
         server.write_request_func = _write_request
@@ -183,3 +185,4 @@ class BlessPeripheralTransport(Transport):
         self._server = None
         if server is not None:
             await server.stop()
+        await self._shutdown_dispatch()

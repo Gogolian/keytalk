@@ -2,9 +2,24 @@
 
 The consumer owns a :class:`~keytalk.transport.Transport` (in production a BLE
 central connected to the host).  :meth:`ConsumerClient.generate` returns the
-whole answer; :meth:`ConsumerClient.stream` yields response text incrementally
-as frames arrive.  Each outstanding request is tracked by ``message_id`` so the
-client can multiplex several prompts over one link.
+whole answer; :meth:`ConsumerClient.stream` yields response text pieces
+incrementally as frames arrive.  Each outstanding request is tracked by
+``message_id`` so the client can multiplex several prompts over one link.
+
+Resilience:
+
+* Prompts are zlib-compressed before chunking (responses are compressed by the
+  host and decompressed here incrementally).
+* When a response stalls (link drop, lost notification) the consumer sends a
+  RESUME asking the host to retransmit from the last contiguous sequence
+  number, so ``stream()`` continues exactly where it left off.
+* Requests that fail before producing any output are retried from scratch with
+  a fresh message id; ``generate`` also retries after partial output (it can
+  discard it safely).
+* When a streamed request is abandoned early a CANCEL is sent so the host can
+  stop generating.
+* A periodic PING keeps the BLE link alive and triggers the transport's
+  reconnect logic before a user request pays for it.
 """
 
 from __future__ import annotations
@@ -15,26 +30,27 @@ import itertools
 import json
 import logging
 import zlib
+from collections import OrderedDict
 from typing import AsyncIterator, Dict, List, Optional
 
-from .modes import LEGACY_PROFILE, Mode, ProfileConfig, negotiate_mode, mode_id_for, make_l2cap_coc_profile
+from .modes import LEGACY_PROFILE, Mode, ProfileConfig, mode_id_for, negotiate_mode
 from .protocol import (
-    DEFAULT_ATT_MTU,
     CHECKSUM_SIZE,
+    DEFAULT_ATT_MTU,
     Flags,
     Frame,
     MessageType,
     ProtocolError,
-    Reassembler,
+    RESUME_UNKNOWN,
     chunk_message,
-    max_payload_for_mtu,
-    compute_message_checksum,
-    encode_delta_payload,
-    decode_delta_payload,
+    encode_cancel,
+    encode_max_payload,
+    encode_resume,
     encode_select_payload,
+    max_payload_for_mtu,
 )
 from .reliability import make_ack_frame
-from .transport import Transport
+from .transport import Transport, TransportClosed
 
 __all__ = ["ConsumerClient", "RemoteError", "_PendingRequest"]
 
@@ -42,9 +58,29 @@ logger = logging.getLogger("keytalk.consumer")
 
 DEFAULT_TIMEOUT = 300.0
 
+#: Message id reserved for control messages (HELLO/PING/RESUME/CANCEL).
+CONTROL_ID = 0
+
+#: Bound on the out-of-order buffer for one request (frames).  Far more than
+#: the sender's window ever keeps in flight; anything beyond means trouble.
+MAX_REORDER = 512
+
+#: How many completed-message ACK values to remember for late retransmissions.
+MAX_COMPLETED_ACKS = 256
+
 
 class RemoteError(Exception):
     """Raised when the host returns an ERROR message for a request."""
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Whether a failed attempt can simply be run again from scratch."""
+
+    if isinstance(exc, RemoteError):
+        # The host no longer knows the request (e.g. it was restarted between
+        # our RESUME and its replay): restartable, unlike real backend errors.
+        return str(exc) == RESUME_UNKNOWN
+    return isinstance(exc, (asyncio.TimeoutError, TransportClosed, ConnectionError, OSError))
 
 
 class _PendingRequest:
@@ -56,30 +92,51 @@ class _PendingRequest:
     in sequence rather than treated as a fatal error.  Completion is signalled
     with a sentinel so an async iterator terminates cleanly.
 
-    When ``reassemble=True`` (used by FAST_GATT), all frames are fed through a
-    :class:`Reassembler` which handles decompression and CRC32 verification;
-    the decoded payload is emitted as a single chunk once the END frame arrives.
+    Compressed responses (``COMPRESSED`` on the START frame) are decompressed
+    incrementally.  ERROR frames are never compressed: the host flushes the
+    compressed stream before switching to error frames, so data can be
+    attributed to the frame type that carried it.
     """
 
     _END = object()
 
-    def __init__(self, message_id: int, *, reassemble: bool = False) -> None:
+    def __init__(self, message_id: int) -> None:
         self.message_id = message_id
         self._queue: "asyncio.Queue[object]" = asyncio.Queue()
         self._next_seq = 0
         self._reorder: Dict[int, Frame] = {}
         self._started = False
         self._done = False
-        self._reassemble = reassemble
-        self._inner: Optional[Reassembler] = Reassembler() if reassemble else None
-        self._decompressor: Optional[zlib.Decompress] = None
-        self._running_crc: int = 0
+        self._dec = None  # incremental zlib decompressor, if compressed
+        self._crc = 0  # running CRC32 over wire payloads (CHECKSUM messages)
+        #: Raw TIMINGS trailer payloads (generation stats; see host._finish_message)
+        self.meta_parts: List[bytes] = []
+        #: Frames accepted so far; used to detect progress vs. stalls.
+        self.activity = 0
 
     @property
     def ack_seq(self) -> int:
         """Next contiguous sequence number expected (cumulative ACK value)."""
 
         return self._next_seq
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    @property
+    def timings(self) -> Optional[dict]:
+        """Generation stats from the message's TIMINGS trailer, if present."""
+
+        if not self.meta_parts:
+            return None
+        try:
+            obj = json.loads(b"".join(self.meta_parts).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("malformed timings trailer for %s", self.message_id)
+            return None
+        value = obj.get("timings") if isinstance(obj, dict) else None
+        return value if isinstance(value, dict) else None
 
     def feed(self, frame: Frame) -> None:
         """Validate and enqueue an inbound frame for this request.
@@ -100,7 +157,16 @@ class _PendingRequest:
             )
             return
 
+        if len(self._reorder) >= MAX_REORDER:
+            self._fail(
+                ProtocolError(
+                    f"response {self.message_id} exceeded the reorder buffer"
+                )
+            )
+            return
+
         self._reorder[frame.seq] = frame
+        self.activity += 1
         # Deliver every frame that is now contiguous from _next_seq onwards.
         while self._next_seq in self._reorder:
             self._process(self._reorder.pop(self._next_seq))
@@ -118,58 +184,49 @@ class _PendingRequest:
                 )
                 return
             self._started = True
-            if not self._reassemble and (frame.flags & Flags.COMPRESSED):
-                self._decompressor = zlib.decompressobj()
+            if frame.flags & Flags.COMPRESSED:
+                self._dec = zlib.decompressobj()
 
-        if self._reassemble:
-            # Route through the inner Reassembler for decompression + CRC32.
-            assert self._inner is not None
-            try:
-                result = self._inner.feed(frame)
-            except ProtocolError as exc:
-                self._fail(exc)
-                return
-            if result is not None:
-                if result.msg_type == MessageType.ERROR:
-                    self._queue.put_nowait(("error", result.payload))
-                else:
-                    self._queue.put_nowait(("data", result.payload))
-                self._next_seq += 1  # mirrors legacy END handling
-                self._done = True
-                self._queue.put_nowait(self._END)
-            return
-
-        # Legacy streaming path: emit each frame payload immediately.
         if frame.msg_type == MessageType.ERROR:
-            # Error payloads can also span multiple frames; accumulate until END.
+            # Error payloads can also span multiple frames; accumulate until
+            # END.  They are plain text even when the response was compressed.
             self._queue.put_nowait(("error", frame.payload))
+        elif frame.msg_type == MessageType.TIMINGS:
+            # Plain-text stats trailer (never compressed); never streamed out.
+            self.meta_parts.append(frame.payload)
         elif frame.msg_type == MessageType.RESPONSE:
-            payload = frame.payload
-            if self._decompressor is not None:
-                # Strip and verify CRC32 trailer before decompressing.
-                if frame.is_end and (frame.flags & Flags.CHECKSUM):
-                    if len(payload) < CHECKSUM_SIZE:
-                        self._fail(ProtocolError("CHECKSUM END frame payload too short"))
-                        return
-                    payload_data = payload[:-CHECKSUM_SIZE]
-                    expected_crc = int.from_bytes(payload[-CHECKSUM_SIZE:], "big")
-                    self._running_crc = zlib.crc32(payload_data, self._running_crc) & 0xFFFFFFFF
-                    if self._running_crc != expected_crc:
-                        self._fail(ProtocolError("CRC32 mismatch on reassembled response"))
-                        return
-                    payload = payload_data
-                else:
-                    self._running_crc = zlib.crc32(payload, self._running_crc) & 0xFFFFFFFF
-                try:
-                    decompressed = self._decompressor.decompress(payload)
-                    if frame.is_end:
-                        decompressed += self._decompressor.flush()
-                    payload = decompressed
-                except zlib.error as exc:
-                    self._fail(ProtocolError(f"decompression failed: {exc}"))
+            data = frame.payload
+            # Strip and verify the CRC32 trailer when the END frame carries one
+            # (buffered/checksummed senders), regardless of compression.
+            if frame.is_end and (frame.flags & Flags.CHECKSUM):
+                if len(data) < CHECKSUM_SIZE:
+                    self._fail(
+                        ProtocolError("CHECKSUM END frame payload too short")
+                    )
                     return
-            if payload:
-                self._queue.put_nowait(("data", payload))
+                body, trailer = data[:-CHECKSUM_SIZE], data[-CHECKSUM_SIZE:]
+                self._crc = zlib.crc32(body, self._crc) & 0xFFFFFFFF
+                expected = int.from_bytes(trailer, "big")
+                if self._crc != expected:
+                    self._fail(
+                        ProtocolError("CRC32 mismatch on reassembled response")
+                    )
+                    return
+                data = body
+            else:
+                self._crc = zlib.crc32(data, self._crc) & 0xFFFFFFFF
+            if self._dec is not None:
+                try:
+                    data = self._dec.decompress(data)
+                except zlib.error:
+                    self._fail(
+                        ProtocolError(
+                            f"failed to decompress response {self.message_id}"
+                        )
+                    )
+                    return
+            if data:
+                self._queue.put_nowait(("data", data))
         else:
             self._fail(
                 ProtocolError(
@@ -180,6 +237,10 @@ class _PendingRequest:
             return
 
         if frame.is_end:
+            if self._dec is not None:
+                tail = self._dec.flush()
+                if tail:
+                    self._queue.put_nowait(("data", tail))
             self._next_seq += 1
             self._done = True
             self._queue.put_nowait(self._END)
@@ -226,71 +287,98 @@ class ConsumerClient:
         profile: Optional[ProfileConfig] = None,
         requested_mode: str = "auto",
         mtu: int = DEFAULT_ATT_MTU,
+        max_mtu: int = 512,
         max_payload_size: Optional[int] = None,
         timeout: float = DEFAULT_TIMEOUT,
         compress_prompts: bool = True,
-        enable_delta_messages: bool = True,
+        retries: int = 2,
+        max_resumes: int = 3,
+        keepalive_interval: float = 15.0,
     ) -> None:
         self._transport = transport
         self._profile = profile or LEGACY_PROFILE
-        # If an explicit profile was supplied, skip negotiation.
-        self._requested_mode: Optional[str] = None if profile is not None else requested_mode
+        # An explicit profile skips negotiation entirely.
+        self._requested_mode: Optional[str] = (
+            None if profile is not None else requested_mode
+        )
         self._max_payload = (
             max_payload_size
             if max_payload_size is not None
             else max_payload_for_mtu(profile.mtu if profile is not None else mtu)
         )
+        self._explicit_payload = max_payload_size is not None
+        self._max_mtu = max_mtu
         if self._max_payload <= 0:
             raise ValueError("max_payload_size must be positive")
+        #: Idle timeout per response piece; a stall triggers a RESUME.
         self._timeout = timeout
         self._compress_prompts = compress_prompts
-        self._enable_delta_messages = enable_delta_messages
+        self._retries = retries
+        self._max_resumes = max_resumes
+        self._keepalive_interval = keepalive_interval
+        self._keepalive_task: Optional["asyncio.Task[None]"] = None
         self._pending: Dict[int, _PendingRequest] = {}
         # Final ACK value for recently-completed messages, so a retransmitted
         # tail frame (arriving after we stopped tracking the request) can still
         # be acknowledged and the host's sender can drain.
-        self._completed_acks: Dict[int, int] = {}
-        # message_id 0 is reserved/avoided; ids wrap within the 16-bit space.
+        self._completed_acks: "OrderedDict[int, int]" = OrderedDict()
+        # message_id 0 is reserved for control messages; request ids wrap
+        # within the rest of the 16-bit space.
         self._ids = itertools.cycle(range(1, 0x10000))
-        # Track conversation history for delta detection
-        self._conversation_history: bytes = b""
-        self._history_checksum: str = ""
+        # Generation stats (llama.cpp timings, incl. MTP acceptance) captured
+        # from the most recently completed request's TIMINGS trailer.
+        self._last_timings: Optional[dict] = None
+
+    @property
+    def last_timings(self) -> Optional[dict]:
+        """Server-side generation stats for the most recent request, if any."""
+
+        return self._last_timings
 
     async def start(self) -> None:
         self._transport.on_receive(self._on_frame)
         await self._transport.start()
+        # If the transport knows the negotiated link MTU (BLE adapters do),
+        # size frames to it instead of the conservative 23-byte ATT default -
+        # this is a ~10x throughput win - and tell the host what we accept.
+        link_mtu = int(getattr(self._transport, "mtu_size", DEFAULT_ATT_MTU) or 0)
+        if link_mtu > DEFAULT_ATT_MTU and not self._explicit_payload:
+            self._max_payload = max_payload_for_mtu(min(link_mtu, self._max_mtu))
+            logger.info("link MTU %d: frame payload %d bytes", link_mtu, self._max_payload)
         await self._negotiate()
+        await self._send_control(MessageType.HELLO, encode_max_payload(self._max_payload))
+        if self._keepalive_interval > 0:
+            self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
 
     async def _negotiate(self) -> None:
-        """Run the Phase-1 capability handshake, if supported by the transport."""
+        """Run the Phase-1 capability handshake (transfer-mode negotiation).
+
+        Reads the host's CAPS advertisement (if any), picks the best common
+        mode, reconfigures this side (frame size, write mode), and tells the
+        host via a SELECT frame so both ends agree for this connection.
+        """
+
         if self._requested_mode is None:
-            return  # explicit profile supplied at construction — skip
+            return  # explicit profile supplied at construction - skip
         host_modes = await self._transport.read_caps()
         new_profile = negotiate_mode(host_modes, self._requested_mode)
         prev_mode = self._profile.mode
         self._profile = new_profile
-        # For FAST_GATT and L2CAP_COC, size max_payload and switch write mode.
-        if new_profile.mode == Mode.FAST_GATT:
-            mtu = self._transport.mtu_size
+        mtu = self._transport.mtu_size
+        if new_profile.mode in (Mode.FAST_GATT, Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM):
             self._max_payload = max_payload_for_mtu(mtu)
+        if new_profile.mode == Mode.FAST_GATT:
             self._transport.configure_write_mode(write_with_response=False)
         elif new_profile.mode == Mode.L2CAP_COC:
             # PSM read and L2CAP channel open happen at the BLE transport layer;
-            # the transport switch is coordinated by BleakCentralTransport when
-            # running on real hardware.  For in-process tests the L2CAP transport
-            # is wired directly and negotiation is bypassed via profile=.
-            mtu = self._transport.mtu_size
-            self._max_payload = max_payload_for_mtu(mtu)
+            # for in-process tests the L2CAP transport is wired directly.
             psm = await self._transport.read_l2cap_psm()
             if psm is not None:
-                logger.info("L2CAP_COC: host PSM=%d (channel open deferred to BLE layer)", psm)
-        elif new_profile.mode == Mode.CLASSIC_RFCOMM:
-            # RFCOMM channel setup happens at the Classic transport layer; for
-            # in-process tests the transport is wired directly via profile=.
-            mtu = self._transport.mtu_size
-            self._max_payload = max_payload_for_mtu(mtu)
+                logger.info(
+                    "L2CAP_COC: host PSM=%d (channel open deferred to BLE layer)",
+                    psm,
+                )
         # Send SELECT so the host knows the agreed mode and the consumer's MTU.
-        mtu = self._transport.mtu_size
         select_frame = Frame(
             msg_type=MessageType.SELECT,
             message_id=0,  # reserved control channel
@@ -301,18 +389,29 @@ class ConsumerClient:
         await self._transport.send(select_frame.encode())
         if prev_mode != new_profile.mode:
             logger.info(
-                "Bluetooth mode: %s → %s (MTU=%d, host caps=%s)",
-                prev_mode.value, new_profile.mode.value, mtu,
+                "Bluetooth mode: %s -> %s (MTU=%d, host caps=%s)",
+                prev_mode.value,
+                new_profile.mode.value,
+                mtu,
                 host_modes if host_modes is not None else "n/a (legacy host)",
             )
         else:
             logger.info(
                 "Bluetooth mode: %s (MTU=%d, host caps=%s)",
-                new_profile.mode.value, mtu,
+                new_profile.mode.value,
+                mtu,
                 host_modes if host_modes is not None else "n/a (legacy host)",
             )
 
     async def close(self) -> None:
+        task = self._keepalive_task
+        self._keepalive_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await self._transport.close()
 
     async def __aenter__(self) -> "ConsumerClient":
@@ -330,19 +429,9 @@ class ConsumerClient:
         except ProtocolError:
             logger.exception("dropping malformed response frame")
             return
-        # The consumer never expects ACK frames itself; ignore defensively.
-        if frame.msg_type == MessageType.ACK:
-            return
-        # Control frames (CAPS, SELECT, HELLO, NAK) are not routed to pending
-        # requests; ignore them so unexpected control traffic doesn't surface
-        # as errors after negotiation completes.
-        if frame.msg_type in (
-            MessageType.CAPS,
-            MessageType.SELECT,
-            MessageType.HELLO,
-            MessageType.NAK,
-        ):
-            logger.debug("ignoring control frame type %s", frame.msg_type.name)
+        # The consumer never expects ACK or PING frames itself; PONG is the
+        # reply to our keepalive and needs no handling.
+        if frame.msg_type in (MessageType.ACK, MessageType.PING, MessageType.PONG):
             return
         pending = self._pending.get(frame.message_id)
         if pending is None:
@@ -367,6 +456,41 @@ class ConsumerClient:
         except Exception:  # pragma: no cover - best effort over a failing link
             logger.debug("failed to send ACK for %s", message_id, exc_info=True)
 
+    async def _send_control(self, msg_type: MessageType, payload: bytes = b"") -> None:
+        """Send a single control message (id 0) to the host."""
+
+        frames = chunk_message(msg_type, CONTROL_ID, payload, self._max_payload)
+        for frame in frames:
+            await self._transport.send(frame.encode())
+
+    async def _send_resume(self, message_id: int, ack_seq: int) -> None:
+        logger.warning(
+            "response for message %s stalled; requesting retransmission from seq %d",
+            message_id,
+            ack_seq,
+        )
+        await self._send_control(MessageType.RESUME, encode_resume(message_id, ack_seq))
+
+    def _fire_cancel(self, message_id: int) -> None:
+        """Tell the host to stop generating for an abandoned request."""
+
+        async def _run() -> None:
+            try:
+                await self._send_control(MessageType.CANCEL, encode_cancel(message_id))
+                logger.info("cancelled request %s on the host", message_id)
+            except Exception:  # noqa: BLE001 - best effort
+                logger.debug("failed to send CANCEL for %s", message_id, exc_info=True)
+
+        asyncio.ensure_future(_run())
+
+    async def _keepalive_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._keepalive_interval)
+            try:
+                await self._send_control(MessageType.PING)
+            except Exception:  # noqa: BLE001 - the next request retries anyway
+                logger.debug("keepalive ping failed", exc_info=True)
+
     # -- public API -----------------------------------------------------------
 
     def _alloc_id(self) -> int:
@@ -378,37 +502,19 @@ class ConsumerClient:
                 return candidate
         raise RuntimeError("no free message ids available")
 
+    def _remember_ack(self, message_id: int, ack_seq: int) -> None:
+        self._completed_acks[message_id] = ack_seq
+        self._completed_acks.move_to_end(message_id)
+        while len(self._completed_acks) > MAX_COMPLETED_ACKS:
+            self._completed_acks.popitem(last=False)
+
     async def _send_message(
         self, message_id: int, msg_type: MessageType, payload: bytes
     ) -> None:
-        # Try delta encoding for prompts if enabled and we have history
-        is_delta = False
-        if (self._enable_delta_messages and 
-            msg_type == MessageType.PROMPT and 
-            self._conversation_history and 
-            len(payload) > len(self._conversation_history)):
-            
-            # Check if the new message starts with the old conversation history
-            if payload[:len(self._conversation_history)] == self._conversation_history:
-                # Extract only the new part
-                delta_content = payload[len(self._conversation_history):]
-                original_payload_size = len(payload)
-                
-                # Encode with checksum reference
-                payload = encode_delta_payload(self._history_checksum, delta_content)
-                is_delta = True
-                
-                logger.info(
-                    "Detected delta prompt: %d bytes -> %d bytes (%.1f%% saved via delta)",
-                    original_payload_size,
-                    len(payload),
-                    100 * (1 - len(payload) / original_payload_size)
-                )
-        
-        # Compress prompts to reduce BLE transmission time
+        # Compress prompts/chat payloads to reduce BLE transmission time
         compressed = False
         original_size = len(payload)
-        if self._compress_prompts and msg_type == MessageType.PROMPT and payload:
+        if self._compress_prompts and msg_type in (MessageType.PROMPT, MessageType.CHAT) and payload:
             compressed_payload = zlib.compress(payload, level=6)
             # Only use compression if it actually saves space
             if len(compressed_payload) < len(payload):
@@ -441,15 +547,12 @@ class ConsumerClient:
             message_id,
             payload,
             self._max_payload,
-            checksum=self._profile.mode in (Mode.FAST_GATT, Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM),
         )
         # Mark first frame with appropriate flags
         if frames:
             flags = frames[0].flags
             if compressed:
                 flags |= Flags.COMPRESSED
-            if is_delta:
-                flags |= Flags.DELTA
             if flags != frames[0].flags:
                 frames[0] = Frame(
                     msg_type=frames[0].msg_type,
@@ -464,61 +567,166 @@ class ConsumerClient:
         logger.info("✓ %s sent, waiting for response...", msg_type.name)
 
     def stream(self, prompt: str) -> AsyncIterator[str]:
-        """Send ``prompt`` and yield response text pieces as they arrive."""
+        """Send ``prompt`` and yield response text pieces as they arrive.
 
-        return self._stream(prompt.encode("utf-8"), MessageType.PROMPT)
+        Transparently resumes after link drops; only retries the whole prompt
+        if nothing has been yielded yet (retrying later would duplicate text).
+        """
+
+        return self._stream(prompt.encode("utf-8"), MessageType.PROMPT, retries=self._retries)
+
+    def chat_stream(self, messages: List[dict], **params) -> AsyncIterator[str]:
+        """Send structured chat ``messages`` and yield the reply incrementally.
+
+        Unlike ``stream`` (which sends a pre-rendered prompt string), the
+        messages are passed to the host as JSON so a backend with native chat
+        support can render the model's own chat template server-side.
+        ``params`` (e.g. ``temperature``) are forwarded to the backend.
+        """
+
+        return self._stream(
+            self._chat_payload(messages, params), MessageType.CHAT, retries=self._retries
+        )
+
+    async def chat(self, messages: List[dict], **params) -> str:
+        """Send structured chat ``messages`` and return the complete reply."""
+
+        data = self._chat_payload(messages, params)
+        attempts = 0
+        while True:
+            attempt = self._attempt(data, MessageType.CHAT)
+            try:
+                parts = [piece async for piece in attempt]
+                return "".join(parts)
+            except BaseException as exc:  # noqa: BLE001 - classified below
+                if not _is_retryable(exc) or attempts >= self._retries:
+                    raise
+                attempts += 1
+                logger.warning(
+                    "chat failed (%s); retrying (%d/%d)",
+                    exc,
+                    attempts,
+                    self._retries,
+                )
+                await asyncio.sleep(min(0.5 * attempts, 2.0))
+            finally:
+                await attempt.aclose()
+
+    @staticmethod
+    def _chat_payload(messages: List[dict], params: dict) -> bytes:
+        request: Dict[str, object] = {"messages": list(messages)}
+        if params:
+            request["params"] = params
+        return json.dumps(request, separators=(",", ":")).encode("utf-8")
 
     async def _stream(
-        self, payload: bytes, msg_type: MessageType
+        self, payload: bytes, msg_type: MessageType, *, retries: int = 0
     ) -> AsyncIterator[str]:
+        yielded = False
+        attempts = 0
+        while True:
+            attempt = self._attempt(payload, msg_type)
+            try:
+                async for piece in attempt:
+                    yielded = True
+                    yield piece
+                return
+            except BaseException as exc:  # noqa: BLE001 - classified below
+                if not _is_retryable(exc) or yielded or attempts >= retries:
+                    raise
+                attempts += 1
+                logger.warning(
+                    "%s failed (%s); retrying (%d/%d)",
+                    msg_type.name,
+                    exc,
+                    attempts,
+                    retries,
+                )
+                await asyncio.sleep(min(0.5 * attempts, 2.0))
+            finally:
+                # Deterministically finalize the attempt (and thus CANCEL any
+                # half-received request on the host) even when this generator
+                # is closed early by its caller.
+                await attempt.aclose()
+
+    async def _attempt(self, payload: bytes, msg_type: MessageType) -> AsyncIterator[str]:
         message_id = self._alloc_id()
-        # FAST_GATT, L2CAP_COC and CLASSIC_RFCOMM now use the streaming path by
-        # default; COMPRESSED flag on the START frame triggers incremental
-        # decompression in _PendingRequest so text appears as tokens arrive.
         pending = _PendingRequest(message_id)
         self._pending[message_id] = pending
-        
-        # Track the original prompt for history
-        original_prompt = payload
-        
+        # The piece-getter is awaited with asyncio.wait() rather than
+        # wait_for(): timing out must NOT cancel it, because that would close
+        # the iterator and silently truncate the response on resume.
+        next_piece: Optional["asyncio.Task[str]"] = None
         try:
             await self._send_message(message_id, msg_type, payload)
-            
-            # Collect the response for history tracking
-            response_parts: List[str] = []
-            
             iterator = pending.__aiter__()
+            next_piece = asyncio.ensure_future(iterator.__anext__())
+            resumes = 0
+            last_activity = pending.activity
             while True:
+                done, _ = await asyncio.wait({next_piece}, timeout=self._timeout)
+                if not done:
+                    # The stream stalled (link drop, lost notification): ask
+                    # the host to retransmit from our position before failing.
+                    if pending.activity != last_activity:
+                        last_activity = pending.activity
+                        resumes = 0
+                    if resumes >= self._max_resumes:
+                        raise asyncio.TimeoutError(
+                            f"response for message {message_id} stalled "
+                            f"after {resumes} retransmission requests"
+                        )
+                    resumes += 1
+                    await self._send_resume(message_id, pending.ack_seq)
+                    continue
                 try:
-                    piece = await iterator.__anext__()
+                    piece = next_piece.result()
                 except StopAsyncIteration:
-                    break
-                response_parts.append(piece)
+                    self._last_timings = pending.timings
+                    return
+                resumes = 0
                 yield piece
-            
-            # Update conversation history if this was a successful prompt
-            if msg_type == MessageType.PROMPT and self._enable_delta_messages:
-                response_text = "".join(response_parts)
-                # Build new history: old_prompt + old_response + new_prompt + new_response
-                new_history = original_prompt + response_text.encode("utf-8")
-                self._conversation_history = new_history
-                self._history_checksum = compute_message_checksum(new_history)
-                logger.debug(
-                    "Updated conversation history: %d bytes, checksum=%s",
-                    len(self._conversation_history),
-                    self._history_checksum
-                )
+                next_piece = asyncio.ensure_future(iterator.__anext__())
         finally:
+            if next_piece is not None and not next_piece.done():
+                next_piece.cancel()
             # Remember the final ACK so late retransmissions of the tail can
             # still be acknowledged, then stop tracking the live request.
-            self._completed_acks[message_id] = pending.ack_seq
+            self._remember_ack(message_id, pending.ack_seq)
             self._pending.pop(message_id, None)
+            if not pending.done:
+                # The request was abandoned early (error, timeout, or the
+                # caller stopped reading): let the host stop generating.
+                self._fire_cancel(message_id)
 
     async def generate(self, prompt: str) -> str:
-        """Send ``prompt`` and return the complete response text."""
+        """Send ``prompt`` and return the complete response text.
 
-        parts = [piece async for piece in self._stream(prompt.encode("utf-8"), MessageType.PROMPT)]
-        return "".join(parts)
+        Unlike ``stream``, failed attempts are retried even after partial
+        output: nothing has been shown to the caller yet, so it is safe to
+        discard and restart.
+        """
+
+        data = prompt.encode("utf-8")
+        attempts = 0
+        while True:
+            attempt = self._attempt(data, MessageType.PROMPT)
+            try:
+                parts = [piece async for piece in attempt]
+                return "".join(parts)
+            except BaseException as exc:  # noqa: BLE001 - classified below
+                if not _is_retryable(exc) or attempts >= self._retries:
+                    raise
+                attempts += 1
+                logger.warning(
+                    "generate failed (%s); retrying (%d/%d)",
+                    exc,
+                    attempts,
+                    self._retries,
+                )
+                await asyncio.sleep(min(0.5 * attempts, 2.0))
+            finally:
+                await attempt.aclose()
 
     async def list_models(self) -> List[str]:
         """Ask the host which models it can serve.
@@ -528,7 +736,10 @@ class ConsumerClient:
         reports no models or sends an unexpected payload.
         """
 
-        parts = [piece async for piece in self._stream(b"", MessageType.LIST_MODELS)]
+        parts = [
+            piece
+            async for piece in self._stream(b"", MessageType.LIST_MODELS, retries=self._retries)
+        ]
         text = "".join(parts).strip()
         if not text:
             return []

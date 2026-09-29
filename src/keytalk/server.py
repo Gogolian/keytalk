@@ -134,6 +134,22 @@ def _now_unix() -> int:
     return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
 
+async def _close_quietly(stream: object) -> None:
+    """Close a response stream early.
+
+    Closing the generator tells the consumer to send a CANCEL to the host, so
+    abandoned requests stop consuming the remote LLM and the BLE link.
+    """
+
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:  # noqa: BLE001 - best effort on an already-failing path
+        logger.debug("failed to close response stream", exc_info=True)
+
+
 class _Request:
     """A parsed HTTP request."""
 
@@ -521,7 +537,8 @@ class OllamaBridgeServer:
             return obj
 
         await self._stream_completion(
-            request, writer, prompt, model, bool(stream), envelope, "response"
+            request, writer, self._request_stream(prompt=prompt), model,
+            bool(stream), envelope, "response"
         )
 
     async def _handle_chat(
@@ -540,7 +557,6 @@ class OllamaBridgeServer:
         messages: List[Dict[str, object]] = (
             raw_messages if isinstance(raw_messages, list) else []
         )
-        prompt = build_prompt_from_messages(messages)
         model = str(payload.get("model") or self._model)
         stream = payload.get("stream", True)
 
@@ -556,7 +572,8 @@ class OllamaBridgeServer:
             return obj
 
         await self._stream_completion(
-            request, writer, prompt, model, bool(stream), envelope, "message"
+            request, writer, self._request_stream(messages=messages), model,
+            bool(stream), envelope, "message"
         )
 
     async def _handle_openai_chat(
@@ -598,11 +615,13 @@ class OllamaBridgeServer:
 
         if stream:
             await self._stream_openai(
-                request, writer, prompt, model, completion_id, created
+                request, writer, self._request_stream(messages=messages),
+                model, completion_id, created
             )
         else:
             await self._aggregate_openai(
-                request, writer, prompt, model, completion_id, created
+                request, writer, self._request_stream(messages=messages),
+                model, completion_id, created
             )
 
     @staticmethod
@@ -640,7 +659,7 @@ class OllamaBridgeServer:
         self,
         request: _Request,
         writer: asyncio.StreamWriter,
-        prompt: str,
+        pieces,
         model: str,
         completion_id: str,
         created: int,
@@ -652,14 +671,14 @@ class OllamaBridgeServer:
                 completion_id, created, model, {"role": "assistant"}, None
             ),
         )
-        pieces = 0
+        count = 0
         chars = 0
         error_text: Optional[str] = None
         try:
-            async for piece in self._client.stream(prompt):
+            async for piece in pieces:
                 if not piece:
                     continue
-                pieces += 1
+                count += 1
                 chars += len(piece)
                 await self._write_sse(
                     writer,
@@ -672,8 +691,10 @@ class OllamaBridgeServer:
         except Exception as exc:  # noqa: BLE001 - surface any backend failure
             logger.exception("error streaming OpenAI completion")
             error_text = self._format_bridge_error(exc)
+        finally:
+            await _close_quietly(pieces)
 
-        if error_text is None and pieces == 0:
+        if error_text is None and count == 0:
             logger.warning(
                 "/v1/chat/completions produced no content from the host "
                 "(empty stream); returning a placeholder message"
@@ -694,12 +715,14 @@ class OllamaBridgeServer:
             )
         await self._write_sse(
             writer,
-            self._openai_chunk(completion_id, created, model, {}, "stop"),
+            self._with_timings(
+                self._openai_chunk(completion_id, created, model, {}, "stop")
+            ),
         )
         if error_text is None:
             logger.info(
                 "/v1/chat/completions streamed %d pieces (%d chars)",
-                pieces,
+                count,
                 chars,
             )
         await self._write_sse_done(writer)
@@ -709,7 +732,7 @@ class OllamaBridgeServer:
         self,
         request: _Request,
         writer: asyncio.StreamWriter,
-        prompt: str,
+        pieces,
         model: str,
         completion_id: str,
         created: int,
@@ -717,7 +740,7 @@ class OllamaBridgeServer:
         parts: List[str] = []
         error_text: Optional[str] = None
         try:
-            async for piece in self._client.stream(prompt):
+            async for piece in pieces:
                 if piece:
                     parts.append(piece)
         except asyncio.CancelledError:  # pragma: no cover - teardown path
@@ -725,6 +748,8 @@ class OllamaBridgeServer:
         except Exception as exc:  # noqa: BLE001 - surface any backend failure
             logger.exception("error generating OpenAI completion")
             error_text = self._format_bridge_error(exc)
+        finally:
+            await _close_quietly(pieces)
 
         text = "".join(parts)
         finish_reason = "stop"
@@ -751,6 +776,7 @@ class OllamaBridgeServer:
                 "total_tokens": 0,
             },
         }
+        self._with_timings(obj)
         await self._write_json(
             writer, 200, obj, keep_alive=request.keep_alive
         )
@@ -773,39 +799,69 @@ class OllamaBridgeServer:
             ],
         }
 
+    def _request_stream(
+        self,
+        *,
+        prompt: Optional[str] = None,
+        messages: Optional[List[Dict[str, object]]] = None,
+    ):
+        """Open the appropriate response stream for a request.
+
+        When the client supports structured chat (``chat_stream``), messages
+        are passed through untouched so the remote backend can render its
+        model's own chat template; otherwise they are flattened into a prompt.
+        """
+
+        if messages is not None:
+            chat_stream = getattr(self._client, "chat_stream", None)
+            if chat_stream is not None:
+                return chat_stream(messages)
+            prompt = build_prompt_from_messages(messages)
+        return self._client.stream(prompt or "")
+
+    def _with_timings(self, obj: Dict[str, object]) -> Dict[str, object]:
+        """Attach server-side generation stats (if any) to a final envelope."""
+
+        timings = getattr(self._client, "last_timings", None)
+        if timings:
+            obj["timings"] = timings
+        return obj
+
     async def _stream_completion(
         self,
         request: _Request,
         writer: asyncio.StreamWriter,
-        prompt: str,
+        pieces,
         model: str,
         stream: bool,
         envelope: Callable[[str, bool], Dict[str, object]],
         aggregate_field: str,
     ) -> None:
         if stream:
-            await self._stream_ndjson(request, writer, prompt, envelope)
+            await self._stream_ndjson(request, writer, pieces, envelope)
         else:
             await self._aggregate_completion(
-                request, writer, prompt, envelope, aggregate_field
+                request, writer, pieces, envelope, aggregate_field
             )
 
     async def _stream_ndjson(
         self,
         request: _Request,
         writer: asyncio.StreamWriter,
-        prompt: str,
+        pieces,
         envelope: Callable[[str, bool], Dict[str, object]],
     ) -> None:
         # Headers are flushed before the model produces anything, so any error
         # must be reported in-band as an Ollama-style ``{"error": ...}`` line.
         await self._begin_chunked(writer, request.keep_alive)
         try:
-            async for piece in self._client.stream(prompt):
+            async for piece in pieces:
                 if not piece:
                     continue
                 await self._write_chunk_json(writer, envelope(piece, False))
-            await self._write_chunk_json(writer, envelope("", True))
+            await self._write_chunk_json(
+                writer, self._with_timings(envelope("", True))
+            )
         except asyncio.CancelledError:  # pragma: no cover - teardown path
             raise
         except Exception as exc:  # noqa: BLE001 - surface any backend failure
@@ -815,19 +871,21 @@ class OllamaBridgeServer:
             final = envelope("", True)
             final["error"] = str(exc)
             await self._write_chunk_json(writer, final)
+        finally:
+            await _close_quietly(pieces)
         await self._end_chunked(writer)
 
     async def _aggregate_completion(
         self,
         request: _Request,
         writer: asyncio.StreamWriter,
-        prompt: str,
+        pieces,
         envelope: Callable[[str, bool], Dict[str, object]],
         aggregate_field: str,
     ) -> None:
         parts: List[str] = []
         try:
-            async for piece in self._client.stream(prompt):
+            async for piece in pieces:
                 if piece:
                     parts.append(piece)
         except asyncio.CancelledError:  # pragma: no cover - teardown path
@@ -838,9 +896,11 @@ class OllamaBridgeServer:
                 writer, 500, {"error": str(exc)}, keep_alive=request.keep_alive
             )
             return
+        finally:
+            await _close_quietly(pieces)
 
         text = "".join(parts)
-        obj = envelope(text, True)
+        obj = self._with_timings(envelope(text, True))
         # For non-streaming chat the assistant content carries the whole text;
         # for generate the ``response`` field does.  ``envelope`` placed the
         # text via its first argument, so the full payload is already correct.

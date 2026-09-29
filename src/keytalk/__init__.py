@@ -18,10 +18,14 @@ from __future__ import annotations
 
 from .backends import (
     EchoBackend,
+    LlamaCppBackend,
+    LlamaCppError,
     LLMBackend,
     OllamaBackend,
     OllamaError,
     StaticBackend,
+    TokenStream,
+    messages_to_prompt,
 )
 from .consumer import ConsumerClient, RemoteError
 from .host import HostService
@@ -68,6 +72,10 @@ __all__ = [
     "StaticBackend",
     "OllamaBackend",
     "OllamaError",
+    "LlamaCppBackend",
+    "LlamaCppError",
+    "TokenStream",
+    "messages_to_prompt",
     # endpoints
     "HostService",
     "ConsumerClient",

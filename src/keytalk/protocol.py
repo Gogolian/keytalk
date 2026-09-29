@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import time
 import zlib
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
@@ -55,6 +56,13 @@ __all__ = [
     "decode_delta_payload",
     "encode_select_payload",
     "decode_select_payload",
+    "RESUME_UNKNOWN",
+    "encode_max_payload",
+    "decode_max_payload",
+    "encode_resume",
+    "decode_resume",
+    "encode_cancel",
+    "decode_cancel",
 ]
 
 PROTOCOL_VERSION = 1
@@ -86,6 +94,18 @@ class MessageType(IntEnum):
     CAPS = 9     # host → consumer: capability advertisement
     SELECT = 10  # consumer → host: select a transfer mode
     NAK = 11     # either direction: reject / signal mismatch (Phase 2+)
+    # Reliability / structured-request extensions (keytalk)
+    PING = 12    # consumer → host: keepalive probe
+    PONG = 13    # host → consumer: keepalive reply
+    RESUME = 14  # consumer → host: retransmit message from a sequence number
+    CHAT = 15    # consumer → host: structured chat messages (JSON)
+    TIMINGS = 16  # generation-statistics trailer frames (host → consumer)
+
+
+#: Error text used by the host when a RESUME references a message it no longer
+#: knows about, so the consumer can tell "request is gone" (retry from scratch)
+#: apart from ordinary backend errors.
+RESUME_UNKNOWN = "keytalk:unknown-request"
 
 
 class Flags(IntFlag):
@@ -276,7 +296,7 @@ def chunk_message(
 class _Buffer:
     """Accumulates frames belonging to a single in-flight message."""
 
-    __slots__ = ("msg_type", "chunks", "next_seq", "compressed", "has_checksum")
+    __slots__ = ("msg_type", "chunks", "next_seq", "compressed", "has_checksum", "at")
 
     def __init__(self, msg_type: MessageType, compressed: bool = False) -> None:
         self.msg_type = msg_type
@@ -284,6 +304,7 @@ class _Buffer:
         self.next_seq = 0
         self.compressed = compressed
         self.has_checksum = False
+        self.at = time.monotonic()
 
 
 class Reassembler:
@@ -297,8 +318,12 @@ class Reassembler:
 
     def __init__(self) -> None:
         self._buffers: Dict[int, _Buffer] = {}
+        self._feeds = 0
 
     def feed(self, frame: Frame) -> Optional[CompleteMessage]:
+        self._feeds += 1
+        if self._feeds % 64 == 0:
+            self.purge_stale()
         buf = self._buffers.get(frame.message_id)
 
         if frame.is_start:
@@ -325,6 +350,7 @@ class Reassembler:
 
         buf.chunks.append(frame.payload)
         buf.next_seq += 1
+        buf.at = time.monotonic()
 
         if frame.is_end:
             if bool(frame.flags & Flags.CHECKSUM):
@@ -367,6 +393,23 @@ class Reassembler:
 
         self._buffers.pop(message_id, None)
 
+    def purge_stale(self, max_age: float = 300.0) -> int:
+        """Drop partial buffers untouched for ``max_age`` seconds.
+
+        A half-received message whose peer vanished would otherwise be buffered
+        forever.  Returns the number of buffers dropped.
+        """
+
+        now = time.monotonic()
+        stale = [
+            message_id
+            for message_id, buf in self._buffers.items()
+            if now - buf.at > max_age
+        ]
+        for message_id in stale:
+            del self._buffers[message_id]
+        return len(stale)
+
     @property
     def pending(self) -> int:
         """Number of partially-received messages currently buffered."""
@@ -382,9 +425,16 @@ class FrameStreamEncoder:
     get back any full frames that can be emitted so far, then call
     :meth:`finish` exactly once to flush the remainder with the ``END`` flag.
 
-    The invariant maintained is that ``finish`` always emits the final frame, so
-    the ``END`` marker is guaranteed to land on the last frame even when the
-    payload size is an exact multiple of ``max_payload_size``.
+    With ``compressed=True`` the frame payloads form a single zlib stream (the
+    ``COMPRESSED`` flag is set on the START frame) and are compressed
+    incrementally; call :meth:`flush` before switching to uncompressed frames
+    (ERROR / TIMINGS trailers) so no compressed bytes are pending across the
+    type change.  With ``checksum=True`` a CRC32 trailer is appended to the
+    final frame (``CHECKSUM`` flag), verified by the :class:`Reassembler`.
+
+    The invariant maintained is that ``finish`` always emits at least one frame
+    with the ``END`` flag on the last one, even when the payload size is an
+    exact multiple of ``max_payload_size``.
     """
 
     def __init__(
@@ -393,6 +443,8 @@ class FrameStreamEncoder:
         message_id: int,
         max_payload_size: int,
         *,
+        compressed: bool = False,
+        level: int = 6,
         checksum: bool = False,
         start_flags: Flags = Flags.NONE,
     ) -> None:
@@ -408,6 +460,8 @@ class FrameStreamEncoder:
         self._finished = False
         self._running_crc = 0  # updated as each payload chunk is emitted
         self._start_flags = start_flags
+        self._compressed = compressed
+        self._comp = zlib.compressobj(level) if compressed else None
 
     @property
     def next_seq(self) -> int:
@@ -425,6 +479,8 @@ class FrameStreamEncoder:
         flags = Flags.NONE
         if not self._started:
             flags |= Flags.START | self._start_flags
+            if self._comp is not None:
+                flags |= Flags.COMPRESSED
             self._started = True
         if last:
             flags |= Flags.END
@@ -455,23 +511,62 @@ class FrameStreamEncoder:
 
         if self._finished:
             raise RuntimeError("cannot push after finish()")
-        frames: List[Frame] = []
+        if self._comp is not None:
+            data = self._comp.compress(data)
         self._buf += data
+        return self._drain()
+
+    def _drain(self) -> List[Frame]:
+        """Emit full frames from the buffer, keeping any partial remainder."""
+
+        frames: List[Frame] = []
         while len(self._buf) > self._max:
             chunk = bytes(self._buf[: self._max])
             del self._buf[: self._max]
             frames.append(self._emit(chunk, last=False))
         return frames
 
+    def flush(self) -> List[Frame]:
+        """Force-emit the buffered bytes as frames *without* ending the message.
+
+        Used at the data -> error/trailer transition, where all pending bytes
+        (including pending compressor state) must be flushed out while frames
+        are still data-typed.
+        """
+
+        if self._finished:
+            raise RuntimeError("cannot flush after finish()")
+        if not self._started and not self._buf:
+            return []  # nothing was ever pushed: do not start the stream
+        if self._comp is not None:
+            # Z_SYNC_FLUSH emits every pending compressed byte without ending
+            # the zlib stream.
+            self._buf += self._comp.flush(zlib.Z_SYNC_FLUSH)
+        frames: List[Frame] = []
+        while self._buf:
+            chunk = bytes(self._buf[: self._max])
+            del self._buf[: self._max]
+            frames.append(self._emit(chunk, last=False))
+        return frames
+
     def finish(self) -> List[Frame]:
-        """Flush the buffered remainder as the final (``END``) frame."""
+        """Flush the buffered remainder as final (``END``) frame(s)."""
 
         if self._finished:
             raise RuntimeError("finish() called twice")
         self._finished = True
-        chunk = bytes(self._buf)
+        if self._comp is not None:
+            self._buf += self._comp.flush()  # Z_FINISH: terminates the stream
+        pieces = [
+            bytes(self._buf[i : i + self._max])
+            for i in range(0, len(self._buf), self._max)
+        ] or [b""]
         self._buf.clear()
-        return [self._emit(chunk, last=True)]
+        last = len(pieces) - 1
+        return [
+            self._emit(piece, last=(index == last))
+            for index, piece in enumerate(pieces)
+        ]
 
 
 def compute_message_checksum(data: bytes) -> str:
@@ -529,3 +624,56 @@ def decode_select_payload(data: bytes) -> tuple[int, int]:
         )
     mode_id, mtu = _SELECT_STRUCT.unpack(data[: _SELECT_STRUCT.size])
     return mode_id, mtu
+
+
+# ---------------------------------------------------------------------------
+# Control-message payload helpers (keytalk reliability extensions)
+#
+# HELLO, RESUME and CANCEL are small enough to fit in a single frame even at
+# the default 23-byte ATT MTU, so their payloads are packed binary rather than
+# JSON.
+# ---------------------------------------------------------------------------
+
+
+def encode_max_payload(max_payload: int) -> bytes:
+    """Encode the HELLO payload: the largest frame payload the peer accepts."""
+
+    if not 0 < max_payload <= _MAX_UINT16:
+        raise ValueError(f"max_payload out of range: {max_payload}")
+    return struct.pack(">H", max_payload)
+
+
+def decode_max_payload(payload: bytes) -> int:
+    """Decode a HELLO payload into a maximum frame payload size."""
+
+    if len(payload) < 2:
+        raise ProtocolError("HELLO payload too short")
+    return struct.unpack(">H", payload[:2])[0]
+
+
+def encode_resume(target_id: int, ack_seq: int) -> bytes:
+    """Encode a RESUME payload: retransmit message ``target_id`` from ``ack_seq``."""
+
+    return struct.pack(">HH", target_id, ack_seq)
+
+
+def decode_resume(payload: bytes) -> tuple[int, int]:
+    """Decode a RESUME payload into ``(target_id, ack_seq)``."""
+
+    if len(payload) < 4:
+        raise ProtocolError("RESUME payload too short")
+    return struct.unpack(">HH", payload[:4])
+
+
+def encode_cancel(target_id: int) -> bytes:
+    """Encode a CANCEL payload: abort message ``target_id``."""
+
+    return struct.pack(">H", target_id)
+
+
+def decode_cancel(payload: bytes) -> int:
+    """Decode a CANCEL payload into the target message id."""
+
+    if len(payload) < 2:
+        raise ProtocolError("CANCEL payload too short")
+    return struct.unpack(">H", payload[:2])[0]

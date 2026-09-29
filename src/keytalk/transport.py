@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import inspect
+import logging
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 from .protocol import DEFAULT_ATT_MTU
 
 __all__ = ["Transport", "TransportClosed", "InMemoryTransport", "create_loopback"]
+
+logger = logging.getLogger("keytalk.transport")
 
 ReceiveCallback = Callable[[bytes], Awaitable[None]]
 
@@ -35,17 +39,61 @@ class Transport(abc.ABC):
 
     def __init__(self) -> None:
         self._receive_cb: Optional[ReceiveCallback] = None
+        # Inbound frames are queued and delivered by a single worker task so
+        # frames are always processed in arrival order, even when the receive
+        # callback suspends (e.g. to write an ACK back).  Delivering each frame
+        # from its own task could reorder them, which breaks reassembly.
+        self._rx_queue: "asyncio.Queue[bytes]" = asyncio.Queue()
+        self._rx_worker: Optional["asyncio.Task[None]"] = None
 
     def on_receive(self, callback: ReceiveCallback) -> None:
         """Register the coroutine invoked for every received frame."""
 
         self._receive_cb = callback
 
-    async def _dispatch(self, frame: bytes) -> None:
-        """Deliver an inbound frame to the registered callback, if any."""
+    def _dispatch(self, frame: bytes) -> None:
+        """Queue an inbound frame for ordered delivery to the registered callback."""
 
-        if self._receive_cb is not None:
-            await self._receive_cb(frame)
+        self._ensure_worker()
+        self._rx_queue.put_nowait(bytes(frame))
+
+    def _ensure_worker(self) -> None:
+        if self._rx_worker is None:
+            self._rx_worker = asyncio.ensure_future(self._rx_loop())
+
+    async def _rx_loop(self) -> None:
+        while True:
+            data = await self._rx_queue.get()
+            cb = self._receive_cb
+            if cb is None:
+                continue
+            try:
+                result = cb(data)
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a bad callback must not kill delivery
+                logger.exception("receive callback raised")
+
+    async def _shutdown_dispatch(self, drain: bool = False) -> None:
+        """Stop the ordered-delivery worker (and optionally flush the queue)."""
+
+        if drain:
+            # Give queued frames a chance to be delivered before teardown so a
+            # peer awaiting a response is not stranded by an abrupt close.
+            for _ in range(1000):
+                if self._rx_queue.empty():
+                    break
+                await asyncio.sleep(0)
+        worker = self._rx_worker
+        self._rx_worker = None
+        if worker is not None:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
 
     @abc.abstractmethod
     async def start(self) -> None:
@@ -129,7 +177,6 @@ class InMemoryTransport(Transport):
         self._closed = False
         #: Every frame this endpoint has sent, in order (handy for assertions).
         self.sent: List[bytes] = []
-        self._inflight: "set[asyncio.Task[None]]" = set()
 
     def link(self, peer: "InMemoryTransport") -> None:
         self._peer = peer
@@ -154,18 +201,16 @@ class InMemoryTransport(Transport):
         if self._closed:
             # Peer went away; silently drop, mirroring a lost BLE link.
             return
-        # Schedule delivery on the loop so send() returns promptly and callbacks
-        # run as independent tasks, like notifications from a real peripheral.
-        task = asyncio.create_task(self._dispatch(frame))
-        self._inflight.add(task)
-        task.add_done_callback(self._inflight.discard)
+        # Queue delivery so send() returns promptly while callbacks run
+        # asynchronously, like notifications from a real peripheral - but in
+        # strict arrival order.
+        self._dispatch(frame)
 
     async def close(self) -> None:
         self._closed = True
-        # Let any already-scheduled deliveries finish so callers awaiting a
-        # response are not stranded by an abrupt teardown.
-        if self._inflight:
-            await asyncio.gather(*self._inflight, return_exceptions=True)
+        # Let already-queued deliveries finish so callers awaiting a response
+        # are not stranded by an abrupt teardown.
+        await self._shutdown_dispatch(drain=True)
 
 
 def create_loopback(

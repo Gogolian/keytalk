@@ -8,6 +8,8 @@ are sent directly over the reliable stream, identical to the L2CAP_COC path.
 from __future__ import annotations
 
 import asyncio
+import random
+import string
 import time
 import unittest
 
@@ -212,6 +214,17 @@ class ClassicRFCOMMProfileTests(unittest.TestCase):
 
 # ── end-to-end integration tests ──────────────────────────────────────────────
 
+def _incompressible(n: int) -> str:
+    """Deterministic pseudo-random text.
+
+    Frame-count comparisons must not be skewed by zlib compression (highly
+    repetitive payloads compress to ~1 frame everywhere), so these tests use
+    payloads that stay close to their raw size on the wire.
+    """
+
+    return "".join(random.Random(42).choices(string.ascii_letters, k=n))
+
+
 class ClassicRFCOMMIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def _make_pair(self, response: str):
         host, consumer = await _make_pair(response)
@@ -256,7 +269,7 @@ class ClassicRFCOMMIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rfcomm_fewer_frames_than_legacy(self):
         """RFCOMM with a 1 KiB MTU sends fewer frames than LEGACY (23-byte MTU)."""
-        response = "w" * 4096
+        response = _incompressible(4096)
 
         # Legacy pair (no CAPS → auto → legacy).
         host_t_l, consumer_t_l = create_loopback()
@@ -347,7 +360,7 @@ class ClassicRFCOMMThroughputBenchmark(unittest.IsolatedAsyncioTestCase):
     _PAYLOAD_SIZE = 8192
 
     async def _run_legacy(self, repeats: int = 3) -> tuple[float, int]:
-        response = "a" * self._PAYLOAD_SIZE
+        response = _incompressible(self._PAYLOAD_SIZE)
         total_bytes = 0
         total_frames = 0
         elapsed = 0.0
@@ -370,7 +383,7 @@ class ClassicRFCOMMThroughputBenchmark(unittest.IsolatedAsyncioTestCase):
         return total_bytes / elapsed, total_frames // repeats
 
     async def _run_rfcomm(self, mtu: int, repeats: int = 3) -> tuple[float, int]:
-        response = "a" * self._PAYLOAD_SIZE
+        response = _incompressible(self._PAYLOAD_SIZE)
         total_bytes = 0
         total_frames = 0
         elapsed = 0.0

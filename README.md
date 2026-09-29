@@ -29,9 +29,14 @@ and reassembled on the far side. keytalk's framing protocol
 (`keytalk.protocol`) handles message ids, sequence numbers, and `START`/`END`
 boundary markers so messages survive fragmentation, interleaving, and streaming.
 
-**Performance**: Prompts are automatically compressed with zlib before chunking,
-typically reducing transmission size by 60-80% and dramatically speeding up
-consumer → host communication.
+**Performance & reliability**: Both directions are compressed with zlib
+(prompts as a whole, responses as a stream), typically reducing transmission
+size by 60-80%. The consumer reports the negotiated BLE MTU to the host
+(`HELLO`), so frames use the full link capacity instead of the 23-byte default
+(~10x fewer frames). Lost notifications are recovered with cumulative
+ACKs + retransmission, and a dead link is survived with automatic `RESUME`
+(replay from the last received frame), request retries, and `CANCEL` of
+abandoned generations.
 
 ## How it is structured
 
@@ -40,6 +45,7 @@ consumer → host communication.
 | `keytalk.protocol` | Transport-agnostic framing, chunking, reassembly, streaming encoder. |
 | `keytalk.transport` | `Transport` interface + in-memory loopback used by the tests. |
 | `keytalk.backends` | `LLMBackend` interface, `OllamaBackend`, `LMStudioBackend`, `OpenRouterBackend`, and test fakes. |
+| `keytalk.backends` | `LLMBackend` interface, `OllamaBackend`, `LMStudioBackend`, `LlamaCppBackend` (llama.cpp with MTP), and test fakes. |
 | `keytalk.host` | `HostService`: prompt frames -> LLM -> streamed response frames. |
 | `keytalk.consumer` | `ConsumerClient`: prompt -> frames -> reassembled/streamed reply. |
 | `keytalk.ble` | Real radio adapters: `bless` peripheral (host), `bleak` central (consumer). |
@@ -77,6 +83,7 @@ keytalk host --backend lmstudio --lmstudio-host http://localhost:1234 --model ge
 # OpenRouter — hosted models via API key
 keytalk host --backend openrouter --model anthropic/claude-3.5-sonnet --openrouter-key sk-or-...
 # or set OPENROUTER_API_KEY in the environment instead of passing --openrouter-key
+keytalk host --backend llamacpp --llamacpp-host http://127.0.0.1:8080   # llama-server
 ```
 
 On the **consumer**:
@@ -84,7 +91,26 @@ On the **consumer**:
 ```bash
 keytalk scan                                   # find the host's address
 keytalk consume --address <ADDRESS> --prompt "Explain BLE GATT in one line."
+keytalk consume --address <ADDRESS> --prompt "..." --retries 3 --keepalive 10
 ```
+
+Both commands accept tuning flags: `keytalk host --mtu 185 --notify-interval
+0.004` controls frame sizing and notification pacing; `keytalk consume
+--retries N --keepalive SECS --timeout SECS --mtu N` controls request retries,
+BLE keepalive pings, the idle timeout before a stalled response is resumed, and
+the cap for the auto-detected link MTU.
+
+### llama.cpp backend (with MTP)
+
+`--backend llamacpp` bridges to a [`llama-server`](https://github.com/ggml-org/llama.cpp)
+instance using its native `/completions` and `/v1/chat/completions` endpoints.
+Structured chat messages are passed through untouched so the model's own Jinja
+chat template (thinking modes, `preserve_thinking`, tool roles) does the
+rendering on the host.  Generation stats reported by the server - including
+multi-token-prediction acceptance (`timings.draft_n` / `draft_n_accepted`) -
+ride back to the consumer via the `TIMINGS` trailer and surface as
+`ConsumerClient.last_timings` (and in the `--serve` done envelopes).  See
+`tools/smoke_llamacpp.py` for a real-server end-to-end check.
 
 ### Ollama-compatible endpoint (`--serve`)
 
@@ -140,6 +166,32 @@ code is identical.
 | PROMPT characteristic (write) | `9a8c0002-7b1e-4f9a-8c3d-2f6b1e9a8c00` |
 | RESPONSE characteristic (notify) | `9a8c0003-7b1e-4f9a-8c3d-2f6b1e9a8c00` |
 
+## Reliability over a lossy link
+
+BLE notifications are fire-and-forget and links drop silently, so the protocol
+is built to recover rather than fail:
+
+| Mechanism | What it does |
+| --- | --- |
+| ACK + retransmission | The consumer cumulatively ACKs response frames; the host retransmits whatever is unacked (Go-Back-N, bounded window doubles as flow control). |
+| `RESUME` | On a stall or after a reconnect the consumer asks for retransmission from its last contiguous sequence number. The host replays from its retained frame store - mid-stream or after completion - so `stream()` continues exactly where it left off. |
+| Request retries | Requests that fail before producing output are retried from scratch (`--retries`); `generate()` also retries after partial output. |
+| `CANCEL` | Abandoning a stream (e.g. an HTTP client disconnecting under `--serve`) tells the host to stop generating, freeing the LLM and the link. |
+| NACK fast-failure | A garbled prompt is answered with an immediate `ERROR` instead of leaving the consumer waiting out its timeout. |
+| Keepalive | Periodic `PING` keeps the link fresh and exercises the transport's reconnect logic (`--keepalive`). |
+| `HELLO` | The consumer announces its frame payload size once the real MTU is known; the host sizes its notifications to match. |
+
+## Beyond GATT: L2CAP CoC
+
+`keytalk.ble.l2cap` carries the same protocol over BLE L2CAP
+Connection-Oriented Channels (Bluetooth 4.2+): reliable credit-based streams
+with negotiated MTUs up to 64 KiB - roughly 10x+ GATT throughput on the same
+radio.  The frame links (`StreamLink` for byte streams, `DatagramLink` for
+message-preserving sockets) and `LinkTransport` are fully unit-tested over real
+socket pairs; Linux/BlueZ gets `open_l2cap_socket`, macOS glue for
+CoreBluetooth's `CBL2CAPChannel` is in `MacStreamPair`.  Two-machine RF testing
+uses `tools/l2cap_smoke.py`.
+
 ## Tests
 
 ```bash
@@ -152,8 +204,11 @@ error cases), the streaming encoder, the loopback transport, the backends and
 Ollama line parsing, and full host<->consumer integration including large
 payloads, Unicode split across frames, empty prompts/responses, incremental
 streaming, backend errors surfacing as `RemoteError`, concurrent requests, id
-reuse, and timeouts.  A dedicated suite also drives the Ollama-compatible
-`--serve` bridge over a real TCP socket — discovery endpoints, streaming and
-non-streaming `/api/generate` and `/api/chat`, chunked encoding, keep-alive,
-malformed-request handling, and the full server → consumer → BLE loopback →
-host pipeline.
+reuse, and timeouts.  Dedicated suites cover compression (prompt round-trips,
+streaming response decompression, clean error transitions) and reliability
+(ACK/retransmission over lossy links, MTU negotiation, NACK fast-failure,
+resume after link outages, whole-request retries, and CANCEL).  A final suite
+drives the Ollama-compatible `--serve` bridge over a real TCP socket —
+discovery endpoints, streaming and non-streaming `/api/generate` and
+`/api/chat`, chunked encoding, keep-alive, malformed-request handling, and the
+full server → consumer → BLE loopback → host pipeline.

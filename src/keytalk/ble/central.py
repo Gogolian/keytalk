@@ -90,6 +90,20 @@ class BleakCentralTransport(Transport):
         self._closed = False
         await self._connect()
 
+    @property
+    def att_mtu(self) -> Optional[int]:
+        """Negotiated ATT MTU of the current connection, if known.
+
+        ``ConsumerClient`` uses this to size frames to the real link instead of
+        the 23-byte Bluetooth default (a ~10x throughput win on macOS where the
+        negotiated MTU is 185).
+        """
+
+        client = self._client
+        if client is None:
+            return None
+        return getattr(client, "mtu_size", None)
+
     async def _connect(self) -> None:
         """Open the GATT connection and resolve characteristics/notifications."""
 
@@ -217,11 +231,11 @@ class BleakCentralTransport(Transport):
         logger.info("✓ Connected to host")
 
         def _notification_handler(_sender: object, data: bytearray) -> None:
-            # bleak invokes this from the event loop; schedule dispatch so an
-            # async callback can run.
+            # bleak invokes this from the event loop.  _dispatch queues the
+            # frame for ordered delivery to the receive callback.
             logger.debug("Received %d bytes from host", len(data))
 
-            asyncio.ensure_future(self._dispatch(bytes(data)))
+            self._dispatch(bytes(data))
 
         logger.debug("Setting up notifications for responses...")
         await self._client.start_notify(self._response_char_obj, _notification_handler)
@@ -378,3 +392,4 @@ class BleakCentralTransport(Transport):
             except Exception:  # pragma: no cover - best effort on teardown
                 pass
             await client.disconnect()
+        await self._shutdown_dispatch()

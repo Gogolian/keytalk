@@ -52,7 +52,7 @@ class L2CAPStreamTransport(Transport):
                 len_bytes = await self._reader.readexactly(_LEN_SIZE)
                 (frame_len,) = _LEN_STRUCT.unpack(len_bytes)
                 frame_bytes = await self._reader.readexactly(frame_len)
-                await self._dispatch(frame_bytes)
+                self._dispatch(frame_bytes)
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
             pass
 

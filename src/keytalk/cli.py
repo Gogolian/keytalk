@@ -33,7 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
     host.add_argument("--model", default="llama3", help="model name")
     host.add_argument(
         "--backend",
-        choices=["ollama", "lmstudio", "openrouter", "dummy"],
+        choices=["ollama", "lmstudio", "openrouter", "dummy", "llamacpp"],
         default="ollama",
         help="LLM backend to use (default: ollama)",
     )
@@ -60,6 +60,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="OpenRouter API key (for --backend=openrouter; falls back to OPENROUTER_API_KEY env var)",
     )
     host.add_argument(
+        "--llamacpp-host",
+        default="http://127.0.0.1:8080",
+        help="base URL of the llama-server instance (for --backend=llamacpp)",
+    )
+    host.add_argument(
+        "--n-predict",
+        type=int,
+        default=0,
+        help="generation cap passed to llama-server as n_predict (0 = server "
+        "default; for --backend=llamacpp)",
+    )
+    host.add_argument(
         "--num-ctx",
         type=int,
         default=32768,
@@ -71,6 +83,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mode",
         default="auto",
         help="transfer mode: auto (default), legacy, fast_gatt, l2cap_coc, rfcomm",
+    )
+    host.add_argument(
+        "--mtu",
+        type=int,
+        default=185,
+        help="ATT MTU to size frames for (default: 185, the typical negotiated "
+        "value). Frame payload = MTU - 10 bytes. The consumer's HELLO can "
+        "shrink this further to match the real link.",
+    )
+    host.add_argument(
+        "--notify-interval",
+        type=float,
+        default=0.004,
+        help="minimum spacing between BLE notifications in seconds; lower is "
+        "faster but may drop frames on lossy radios (default: 0.004)",
     )
     host.add_argument(
         "--verbose",
@@ -94,7 +121,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="prompt text to send (required unless --serve is given)",
     )
     consume.add_argument(
-        "--timeout", type=float, default=300.0, help="response timeout (s)"
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="idle timeout (s) for response data; a stalled response triggers "
+        "an automatic retransmission request before failing",
+    )
+    consume.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="times to retry a failed request from scratch (default: 2)",
+    )
+    consume.add_argument(
+        "--keepalive",
+        type=float,
+        default=15.0,
+        help="interval (s) for BLE keepalive pings, 0 disables (default: 15)",
+    )
+    consume.add_argument(
+        "--mtu",
+        type=int,
+        default=512,
+        help="cap for the auto-detected link MTU (default: 512)",
     )
     consume.add_argument(
         "--serve",
@@ -171,7 +220,16 @@ async def _run_host(args: argparse.Namespace) -> int:
     supported_modes = _mode_to_supported.get(args.mode, ["legacy", "fast_gatt"])
 
     # Select backend
-    if args.backend == "lmstudio":
+    if args.backend == "llamacpp":
+        from .backends import LlamaCppBackend
+
+        backend = LlamaCppBackend(
+            model=args.model,
+            host=args.llamacpp_host,
+            n_predict=args.n_predict,
+        )
+        backend_info = f"llama.cpp: {args.llamacpp_host}"
+    elif args.backend == "lmstudio":
         backend = LMStudioBackend(model=args.model, host=args.lmstudio_host)
         backend_info = f"LM Studio: {args.lmstudio_host}"
     elif args.backend == "openrouter":
@@ -186,9 +244,19 @@ async def _run_host(args: argparse.Namespace) -> int:
         )
         backend_info = f"Ollama: {args.ollama_host}"
     
-    transport = BlessPeripheralTransport(name=args.name, supported_modes=supported_modes)
+    transport = BlessPeripheralTransport(
+        name=args.name,
+        supported_modes=supported_modes,
+        notify_interval=args.notify_interval,
+    )
     profile = profile_for_mode(args.mode)
-    host = HostService(transport, backend, profile=profile, buffer_response=args.buffer_response)
+    host = HostService(
+        transport,
+        backend,
+        profile=profile,
+        buffer_response=args.buffer_response,
+        mtu=args.mtu,
+    )
     await host.start()
     print(f"\nkeytalk host ready!\n"
           f"  Advertising as: {args.name!r}\n"
@@ -220,9 +288,12 @@ async def _run_consume(args: argparse.Namespace) -> int:
     transport = BleakCentralTransport(args.address)
     client = ConsumerClient(
         transport,
-        requested_mode=args.mode,
+
         timeout=args.timeout,
         compress_prompts=not args.no_compress,
+        retries=args.retries,
+        keepalive_interval=args.keepalive,
+        max_mtu=args.mtu,
     )
     await client.start()
     try:
