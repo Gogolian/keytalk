@@ -1,5 +1,10 @@
 # Compression Implementation Summary
 
+> Historical record of the original prompt-compression work. The design has
+> since moved on (responses are compressed too, and buffered mode compresses a
+> whole reply in one shot); see `PLAN.md` and the module docstrings in
+> `protocol.py` / `host.py` for how it works now. Kept for the reasoning.
+
 ## Problem
 Consumer → Host prompt transmission over BLE was very slow. Large prompts (e.g., 2KB) required hundreds of small BLE frame transmissions (177 frames at default MTU), causing significant delays.
 

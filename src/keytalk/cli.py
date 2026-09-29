@@ -21,7 +21,7 @@ from typing import List, Optional
 from .backends import OllamaBackend, LMStudioBackend, OpenRouterBackend, DummyFileBackend
 from .consumer import ConsumerClient
 from .host import HostService
-from .modes import profile_for_mode  # still used by _run_host
+from .modes import NegotiationError, profile_for_mode  # still used by _run_host
 from .server import DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_PORT, OllamaBridgeServer
 
 
@@ -82,7 +82,9 @@ def _build_parser() -> argparse.ArgumentParser:
     host.add_argument(
         "--mode",
         default="auto",
-        help="transfer mode: auto (default), legacy, fast_gatt, l2cap_coc, rfcomm",
+        help="transfer mode: auto (default), legacy, fast_gatt, l2cap_coc, "
+        "rfcomm. Decides which modes this host advertises in its CAPS "
+        "characteristic",
     )
     host.add_argument(
         "--mtu",
@@ -176,7 +178,9 @@ def _build_parser() -> argparse.ArgumentParser:
     consume.add_argument(
         "--mode",
         default="auto",
-        help="transfer mode: auto (default), legacy, fast_gatt, l2cap_coc, rfcomm",
+        help="transfer mode to request: auto (default), legacy, fast_gatt, "
+        "l2cap_coc, rfcomm. Must be offered by the host's CAPS characteristic; "
+        "an explicit mode against an old host is an error",
     )
 
     scan = sub.add_parser("scan", help="discover nearby keytalk hosts")
@@ -286,16 +290,32 @@ async def _run_consume(args: argparse.Namespace) -> int:
     from .ble.central import BleakCentralTransport
 
     transport = BleakCentralTransport(args.address)
-    client = ConsumerClient(
-        transport,
+    try:
+        client = ConsumerClient(
+            transport,
 
-        timeout=args.timeout,
-        compress_prompts=not args.no_compress,
-        retries=args.retries,
-        keepalive_interval=args.keepalive,
-        max_mtu=args.mtu,
-    )
-    await client.start()
+            timeout=args.timeout,
+            compress_prompts=not args.no_compress,
+            retries=args.retries,
+            keepalive_interval=args.keepalive,
+            max_mtu=args.mtu,
+            requested_mode=args.mode,
+        )
+        await client.start()
+    except NegotiationError as exc:
+        # An explicit --mode the host cannot confirm, or an unknown mode name.
+        print(
+            f"error: transfer mode {args.mode!r} was not agreed with the host.\n"
+            f"  {exc}\n"
+            f"  Use --mode auto to accept whatever the host offers.",
+            file=sys.stderr,
+        )
+        await transport.close()
+        return 2
+    except (OSError, RuntimeError) as exc:
+        print(f"error: could not connect to {args.address!r}: {exc}", file=sys.stderr)
+        await transport.close()
+        return 1
     try:
         if args.serve:
             return await _serve_consume(args, client)

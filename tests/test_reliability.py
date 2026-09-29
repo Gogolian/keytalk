@@ -7,13 +7,13 @@ ACK/retransmission in place the stream must still arrive intact and in order.
 
 import asyncio
 import unittest
-from typing import AsyncIterator, List, Optional, Set
+from typing import List, Optional, Set
 
-from keytalk.backends import LLMBackend, StaticBackend
+from keytalk.backends import StaticBackend
 from keytalk.consumer import ConsumerClient, _PendingRequest
 from keytalk.host import HostService
 from keytalk.protocol import Flags, Frame, MessageType
-from keytalk.reliability import ReliableSender, make_ack_frame
+from keytalk.reliability import ReliableSender
 from keytalk.transport import InMemoryTransport
 
 TINY = 6

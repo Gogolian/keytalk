@@ -44,12 +44,13 @@ abandoned generations.
 | --- | --- |
 | `keytalk.protocol` | Transport-agnostic framing, chunking, reassembly, streaming encoder. |
 | `keytalk.transport` | `Transport` interface + in-memory loopback used by the tests. |
-| `keytalk.backends` | `LLMBackend` interface, `OllamaBackend`, `LMStudioBackend`, `OpenRouterBackend`, and test fakes. |
-| `keytalk.backends` | `LLMBackend` interface, `OllamaBackend`, `LMStudioBackend`, `LlamaCppBackend` (llama.cpp with MTP), and test fakes. |
+| `keytalk.backends` | `LLMBackend` interface, `OllamaBackend`, `LMStudioBackend`, `OpenRouterBackend`, `LlamaCppBackend` (llama.cpp with MTP), and test fakes. |
 | `keytalk.host` | `HostService`: prompt frames -> LLM -> streamed response frames. |
 | `keytalk.consumer` | `ConsumerClient`: prompt -> frames -> reassembled/streamed reply. |
 | `keytalk.ble` | Real radio adapters: `bless` peripheral (host), `bleak` central (consumer). |
 | `keytalk.server` | Ollama-compatible HTTP bridge exposed by `keytalk consume --serve`. |
+| `keytalk.toolcalls` | Tool-call rendering/parsing: keeps `tools`/`tool_calls` working end to end. |
+| `keytalk.modes` | Transfer-mode profiles and the capability negotiation. |
 | `keytalk.cli` | `keytalk host` / `keytalk consume` / `keytalk scan` commands. |
 
 The radio layer is the **only** part that needs Bluetooth. Everything else is
@@ -100,6 +101,26 @@ Both commands accept tuning flags: `keytalk host --mtu 185 --notify-interval
 BLE keepalive pings, the idle timeout before a stalled response is resumed, and
 the cap for the auto-detected link MTU.
 
+### Transfer modes
+
+`--mode` picks the transfer profile, on both sides:
+
+```bash
+keytalk host --mode auto              # advertises legacy + fast_gatt
+keytalk consume --mode auto           # accepts the best mode the host offers
+keytalk consume --mode l2cap_coc      # explicit; errors if the host lacks it
+```
+
+`auto` (the default) reads the host's CAPS characteristic and picks the best
+mode both ends support, falling back to legacy against an old host that has no
+CAPS characteristic. An **explicit** `--mode` against such a host is an error
+rather than a silent downgrade, so a typo or an unavailable mode fails fast
+with a clear message.
+
+A mode reported by the peer is treated as untrusted input: it is clamped to the
+consumer's `--mtu` cap and to the host's own `max_mtu` ceiling (1024) before it
+sizes any frame. See `PLAN.md` for the mode table.
+
 ### llama.cpp backend (with MTP)
 
 `--backend llamacpp` bridges to a [`llama-server`](https://github.com/ggml-org/llama.cpp)
@@ -130,7 +151,29 @@ It implements the endpoints clients probe and use: `GET /` (health),
 `POST /api/chat` — with both streaming (newline-delimited JSON) and
 non-streaming (`"stream": false`) responses. Point your Ollama client at
 `http://127.0.0.1:11434` (or whatever `--host`/`--port` you chose) and it will
-transparently talk to the model over Bluetooth LE.
+transparently talk to the model over Bluetooth LE.  The OpenAI-compatible
+`POST /v1/chat/completions` is served too (that is what VS Code Copilot uses).
+
+### Tool calling
+
+Agent clients (VS Code Copilot, IDE extensions, ...) send `tools` with their
+chat requests and expect `tool_calls` back.  Over the bridge:
+
+- **Tool definitions travel with the request.** `tools` / `tool_choice` ride
+  the `CHAT` message as request params and reach the model natively (llama.cpp
+  renders its Jinja tool template), or - for prompt-only backends - as an
+  instruction block teaching a plaintext call syntax.
+- **Structured calls come back structured.** A backend that emits OpenAI
+  `delta.tool_calls` (llama.cpp with a tool parser) has its fragments merged
+  and delivered in the request's trailer (`ConsumerClient.last_tool_calls`).
+- **Plaintext calls are re-framed.** Models without a structured tool channel
+  print calls as text, e.g. `<function=search>{"query": "x"}</function>`,
+  `function search(query="x")`, `to=search {"query": "x"}` or
+  `search{"query": "x"}`.  The bridge detects these, strips them from the
+  content stream (without breaking streaming) and returns them as
+  `message.tool_calls` / `delta.tool_calls` with `finish_reason: "tool_calls"` -
+  so the tool actually gets called instead of the markup being shown as chat
+  text.
 
 ### Library API
 
@@ -212,3 +255,11 @@ drives the Ollama-compatible `--serve` bridge over a real TCP socket —
 discovery endpoints, streaming and non-streaming `/api/generate` and
 `/api/chat`, chunked encoding, keep-alive, malformed-request handling, and the
 full server → consumer → BLE loopback → host pipeline.
+
+`tests/test_negotiation_limits.py` pins the properties that are easy to
+regress: a peer's self-reported MTU is clamped on both sides, a duplicated
+request produces exactly one generation, and buffered mode keeps the same
+guarantees as streaming mode (frame retention for `RESUME`, the `TIMINGS`
+trailer, and backend errors reaching the consumer).  `test_server.py` also
+asserts that per-request tool calls and timings stay isolated when several
+HTTP requests are in flight at once.

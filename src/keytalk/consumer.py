@@ -52,7 +52,7 @@ from .protocol import (
 from .reliability import make_ack_frame
 from .transport import Transport, TransportClosed
 
-__all__ = ["ConsumerClient", "RemoteError", "_PendingRequest"]
+__all__ = ["ConsumerClient", "RemoteError", "ResponseStream", "_PendingRequest"]
 
 logger = logging.getLogger("keytalk.consumer")
 
@@ -71,6 +71,57 @@ MAX_COMPLETED_ACKS = 256
 
 class RemoteError(Exception):
     """Raised when the host returns an ERROR message for a request."""
+
+
+class ResponseStream:
+    """Async text stream carrying one request's trailer metadata.
+
+    The generation stats, structured ``tool_calls`` and ``finish_reason`` a
+    host reports in a message's ``TIMINGS`` trailer belong to *that* request.
+    They ride on the stream object rather than on shared client state, so
+    concurrent requests (e.g. several HTTP connections against ``--serve``)
+    cannot read each other's metadata.
+    """
+
+    def __init__(
+        self,
+        gen: AsyncIterator[str],
+        meta: Optional[Dict[str, object]] = None,
+    ) -> None:
+        self._gen = gen
+        self._meta: Dict[str, object] = meta if meta is not None else {}
+
+    def __aiter__(self) -> "ResponseStream":
+        return self
+
+    async def __anext__(self) -> str:
+        return await self._gen.__anext__()
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._gen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+    @property
+    def timings(self) -> Optional[dict]:
+        """Server-side generation stats for this request, once available."""
+
+        value = self._meta.get("timings")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def tool_calls(self) -> Optional[list]:
+        """Structured tool calls for this request, once available."""
+
+        value = self._meta.get("tool_calls")
+        return value if isinstance(value, list) and value else None
+
+    @property
+    def finish_reason(self) -> Optional[str]:
+        """Backend finish reason for this request, once available."""
+
+        value = self._meta.get("finish_reason")
+        return value if isinstance(value, str) else None
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -109,7 +160,7 @@ class _PendingRequest:
         self._done = False
         self._dec = None  # incremental zlib decompressor, if compressed
         self._crc = 0  # running CRC32 over wire payloads (CHECKSUM messages)
-        #: Raw TIMINGS trailer payloads (generation stats; see host._finish_message)
+        #: Raw TIMINGS trailer payloads (generation meta; see host._finish_message)
         self.meta_parts: List[bytes] = []
         #: Frames accepted so far; used to detect progress vs. stalls.
         self.activity = 0
@@ -128,15 +179,34 @@ class _PendingRequest:
     def timings(self) -> Optional[dict]:
         """Generation stats from the message's TIMINGS trailer, if present."""
 
+        value = self._meta().get("timings")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def tool_calls(self) -> Optional[list]:
+        """Structured tool calls from the message's trailer, if present."""
+
+        value = self._meta().get("tool_calls")
+        return value if isinstance(value, list) and value else None
+
+    @property
+    def finish_reason(self) -> Optional[str]:
+        """Backend finish reason from the message's trailer, if present."""
+
+        value = self._meta().get("finish_reason")
+        return value if isinstance(value, str) else None
+
+    def _meta(self) -> Dict[str, object]:
+        """Parsed trailer payload (``{}`` when there is none / it is malformed)."""
+
         if not self.meta_parts:
-            return None
+            return {}
         try:
             obj = json.loads(b"".join(self.meta_parts).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             logger.warning("malformed timings trailer for %s", self.message_id)
-            return None
-        value = obj.get("timings") if isinstance(obj, dict) else None
-        return value if isinstance(value, dict) else None
+            return {}
+        return obj if isinstance(obj, dict) else {}
 
     def feed(self, frame: Frame) -> None:
         """Validate and enqueue an inbound frame for this request.
@@ -196,9 +266,11 @@ class _PendingRequest:
             self.meta_parts.append(frame.payload)
         elif frame.msg_type == MessageType.RESPONSE:
             data = frame.payload
-            # Strip and verify the CRC32 trailer when the END frame carries one
-            # (buffered/checksummed senders), regardless of compression.
-            if frame.is_end and (frame.flags & Flags.CHECKSUM):
+            # Strip and verify the CRC32 trailer carried by the frame flagged
+            # CHECKSUM (buffered/checksummed senders), regardless of
+            # compression.  The flag - not END - marks the trailer, because a
+            # message may close on a following TIMINGS frame instead.
+            if frame.flags & Flags.CHECKSUM:
                 if len(data) < CHECKSUM_SIZE:
                     self._fail(
                         ProtocolError("CHECKSUM END frame payload too short")
@@ -325,15 +397,30 @@ class ConsumerClient:
         # message_id 0 is reserved for control messages; request ids wrap
         # within the rest of the 16-bit space.
         self._ids = itertools.cycle(range(1, 0x10000))
-        # Generation stats (llama.cpp timings, incl. MTP acceptance) captured
-        # from the most recently completed request's TIMINGS trailer.
+        # Generation metadata (llama.cpp timings incl. MTP acceptance,
+        # structured tool calls, finish reason) captured from the most
+        # recently completed request's TIMINGS trailer.
         self._last_timings: Optional[dict] = None
+        self._last_tool_calls: Optional[list] = None
+        self._last_finish_reason: Optional[str] = None
 
     @property
     def last_timings(self) -> Optional[dict]:
         """Server-side generation stats for the most recent request, if any."""
 
         return self._last_timings
+
+    @property
+    def last_tool_calls(self) -> Optional[list]:
+        """Structured tool calls for the most recent request, if any."""
+
+        return self._last_tool_calls
+
+    @property
+    def last_finish_reason(self) -> Optional[str]:
+        """Backend finish reason for the most recent request, if any."""
+
+        return self._last_finish_reason
 
     async def start(self) -> None:
         self._transport.on_receive(self._on_frame)
@@ -365,8 +452,12 @@ class ConsumerClient:
         prev_mode = self._profile.mode
         self._profile = new_profile
         mtu = self._transport.mtu_size
-        if new_profile.mode in (Mode.FAST_GATT, Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM):
-            self._max_payload = max_payload_for_mtu(mtu)
+        if (
+            new_profile.mode in (Mode.FAST_GATT, Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM)
+            and not self._explicit_payload
+        ):
+            # Same clamp as the link-MTU path in start(): honour --mtu.
+            self._max_payload = max_payload_for_mtu(min(mtu, self._max_mtu))
         if new_profile.mode == Mode.FAST_GATT:
             self._transport.configure_write_mode(write_with_response=False)
         elif new_profile.mode == Mode.L2CAP_COC:
@@ -547,26 +638,13 @@ class ConsumerClient:
             message_id,
             payload,
             self._max_payload,
+            start_flags=Flags.COMPRESSED if compressed else Flags.NONE,
         )
-        # Mark first frame with appropriate flags
-        if frames:
-            flags = frames[0].flags
-            if compressed:
-                flags |= Flags.COMPRESSED
-            if flags != frames[0].flags:
-                frames[0] = Frame(
-                    msg_type=frames[0].msg_type,
-                    message_id=frames[0].message_id,
-                    seq=frames[0].seq,
-                    payload=frames[0].payload,
-                    flags=flags,
-                    version=frames[0].version,
-                )
         for frame in frames:
             await self._transport.send(frame.encode())
         logger.info("✓ %s sent, waiting for response...", msg_type.name)
 
-    def stream(self, prompt: str) -> AsyncIterator[str]:
+    def stream(self, prompt: str) -> ResponseStream:
         """Send ``prompt`` and yield response text pieces as they arrive.
 
         Transparently resumes after link drops; only retries the whole prompt
@@ -575,7 +653,7 @@ class ConsumerClient:
 
         return self._stream(prompt.encode("utf-8"), MessageType.PROMPT, retries=self._retries)
 
-    def chat_stream(self, messages: List[dict], **params) -> AsyncIterator[str]:
+    def chat_stream(self, messages: List[dict], **params) -> ResponseStream:
         """Send structured chat ``messages`` and yield the reply incrementally.
 
         Unlike ``stream`` (which sends a pre-rendered prompt string), the
@@ -591,26 +669,7 @@ class ConsumerClient:
     async def chat(self, messages: List[dict], **params) -> str:
         """Send structured chat ``messages`` and return the complete reply."""
 
-        data = self._chat_payload(messages, params)
-        attempts = 0
-        while True:
-            attempt = self._attempt(data, MessageType.CHAT)
-            try:
-                parts = [piece async for piece in attempt]
-                return "".join(parts)
-            except BaseException as exc:  # noqa: BLE001 - classified below
-                if not _is_retryable(exc) or attempts >= self._retries:
-                    raise
-                attempts += 1
-                logger.warning(
-                    "chat failed (%s); retrying (%d/%d)",
-                    exc,
-                    attempts,
-                    self._retries,
-                )
-                await asyncio.sleep(min(0.5 * attempts, 2.0))
-            finally:
-                await attempt.aclose()
+        return await self._collect(self._chat_payload(messages, params), MessageType.CHAT)
 
     @staticmethod
     def _chat_payload(messages: List[dict], params: dict) -> bytes:
@@ -619,13 +678,28 @@ class ConsumerClient:
             request["params"] = params
         return json.dumps(request, separators=(",", ":")).encode("utf-8")
 
-    async def _stream(
+    def _stream(
         self, payload: bytes, msg_type: MessageType, *, retries: int = 0
+    ) -> ResponseStream:
+        """Wrap the retrying text loop in a per-request metadata carrier."""
+
+        meta: Dict[str, object] = {}
+        return ResponseStream(
+            self._stream_text(payload, msg_type, meta, retries=retries), meta
+        )
+
+    async def _stream_text(
+        self,
+        payload: bytes,
+        msg_type: MessageType,
+        meta: Dict[str, object],
+        *,
+        retries: int = 0,
     ) -> AsyncIterator[str]:
         yielded = False
         attempts = 0
         while True:
-            attempt = self._attempt(payload, msg_type)
+            attempt = self._attempt(payload, msg_type, meta)
             try:
                 async for piece in attempt:
                     yielded = True
@@ -649,7 +723,12 @@ class ConsumerClient:
                 # is closed early by its caller.
                 await attempt.aclose()
 
-    async def _attempt(self, payload: bytes, msg_type: MessageType) -> AsyncIterator[str]:
+    async def _attempt(
+        self,
+        payload: bytes,
+        msg_type: MessageType,
+        meta: Optional[Dict[str, object]] = None,
+    ) -> AsyncIterator[str]:
         message_id = self._alloc_id()
         pending = _PendingRequest(message_id)
         self._pending[message_id] = pending
@@ -682,7 +761,15 @@ class ConsumerClient:
                 try:
                     piece = next_piece.result()
                 except StopAsyncIteration:
+                    # Publish on the per-request carrier first, then mirror onto
+                    # the client's ``last_*`` views for library callers.
+                    if meta is not None:
+                        meta["timings"] = pending.timings
+                        meta["tool_calls"] = pending.tool_calls
+                        meta["finish_reason"] = pending.finish_reason
                     self._last_timings = pending.timings
+                    self._last_tool_calls = pending.tool_calls
+                    self._last_finish_reason = pending.finish_reason
                     return
                 resumes = 0
                 yield piece
@@ -707,10 +794,18 @@ class ConsumerClient:
         discard and restart.
         """
 
-        data = prompt.encode("utf-8")
+        return await self._collect(prompt.encode("utf-8"), MessageType.PROMPT)
+
+    async def _collect(self, payload: bytes, msg_type: MessageType) -> str:
+        """Run a request to completion, retrying from scratch on failure.
+
+        Safe to retry after partial output because nothing has been handed to
+        the caller yet.
+        """
+
         attempts = 0
         while True:
-            attempt = self._attempt(data, MessageType.PROMPT)
+            attempt = self._attempt(payload, msg_type)
             try:
                 parts = [piece async for piece in attempt]
                 return "".join(parts)
@@ -719,7 +814,8 @@ class ConsumerClient:
                     raise
                 attempts += 1
                 logger.warning(
-                    "generate failed (%s); retrying (%d/%d)",
+                    "%s failed (%s); retrying (%d/%d)",
+                    msg_type.name,
                     exc,
                     attempts,
                     self._retries,
@@ -736,10 +832,7 @@ class ConsumerClient:
         reports no models or sends an unexpected payload.
         """
 
-        parts = [
-            piece
-            async for piece in self._stream(b"", MessageType.LIST_MODELS, retries=self._retries)
-        ]
+        parts = [piece async for piece in self._stream(b"", MessageType.LIST_MODELS, retries=self._retries)]
         text = "".join(parts).strip()
         if not text:
             return []

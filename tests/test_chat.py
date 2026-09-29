@@ -179,6 +179,87 @@ class TimingsTrailerTests(ChatTestBase):
         self.assertEqual(consumer.last_timings["note"], "x" * 200)
 
 
+class ToolCallTrailerTests(ChatTestBase):
+    CALLS = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search", "arguments": '{"query": "x"}'},
+        }
+    ]
+
+    @staticmethod
+    def _backend(reply="on it", meta=None):
+        class _CallingBackend(_ChatBackend):
+            def generate_messages(self, messages, **params):
+                self.seen_messages = messages
+                self.seen_params = params
+                text = reply
+
+                async def gen():
+                    yield text
+
+                return TokenStream(gen(), dict(meta or {}))
+
+        return _CallingBackend("unused")
+
+    async def test_tool_calls_roundtrip_on_chat(self):
+        backend = self._backend(
+            meta={"tool_calls": self.CALLS, "finish_reason": "tool_calls"}
+        )
+        _, consumer = await self._make(backend)
+        result = await consumer.chat([{"role": "user", "content": "x"}])
+        self.assertEqual(result, "on it")
+        # structured calls ride the trailer and land on the client
+        self.assertEqual(consumer.last_tool_calls, self.CALLS)
+        self.assertEqual(consumer.last_finish_reason, "tool_calls")
+
+    async def test_tool_calls_roundtrip_on_prompt(self):
+        from keytalk.backends import EchoBackend
+
+        meta = {"tool_calls": self.CALLS, "finish_reason": "tool_calls"}
+
+        class _CallingEcho(EchoBackend):
+            def generate(self, prompt: str):
+                async def gen():
+                    async for piece in EchoBackend.generate(self, prompt):
+                        yield piece
+
+                return TokenStream(gen(), dict(meta))
+
+        _, consumer = await self._make(_CallingEcho())
+        await consumer.generate("hi")
+        self.assertEqual(consumer.last_tool_calls, self.CALLS)
+
+    async def test_no_tool_calls_reports_none(self):
+        _, consumer = await self._make(self._backend())
+        await consumer.chat([{"role": "user", "content": "x"}])
+        self.assertIsNone(consumer.last_tool_calls)
+        self.assertIsNone(consumer.last_finish_reason)
+
+    async def test_tool_call_trailer_survives_heavy_fragmentation(self):
+        # Calls span many trailer frames at TINY payload size and interleave
+        # with the compressed response stream without corrupting either.
+        calls = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "arguments": '{"query": "' + "x" * 200 + '"}',
+                },
+            }
+        ]
+        backend = self._backend(
+            reply="fragmented reply " * 5,
+            meta={"tool_calls": calls, "finish_reason": "tool_calls"},
+        )
+        _, consumer = await self._make(backend)
+        result = await consumer.chat([{"role": "user", "content": "x"}])
+        self.assertEqual(result, "fragmented reply " * 5)
+        self.assertEqual(consumer.last_tool_calls, calls)
+
+
 class PendingRequestTimingsUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_meta_frames_do_not_leak_into_text(self):
         # Drive the pending request exactly like the host emits a message with

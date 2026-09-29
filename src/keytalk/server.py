@@ -33,6 +33,9 @@ from typing import (
     Tuple,
 )
 
+from .backends import messages_to_prompt
+from .toolcalls import ToolCallExtractor, normalize_tool_calls, tool_calls_to_ollama
+
 try:  # pragma: no cover - typing-only convenience
     from typing import Protocol
 except ImportError:  # pragma: no cover - Python < 3.8 has no Protocol
@@ -80,42 +83,22 @@ class PromptStreamer(Protocol):
         ...  # pragma: no cover - optional, structural typing only
 
 
-def build_prompt_from_messages(messages: List[Dict[str, object]]) -> str:
+def build_prompt_from_messages(
+    messages: List[Dict[str, object]], tools: Optional[List[dict]] = None
+) -> str:
+
     """Flatten Ollama ``/api/chat`` messages into a single prompt string.
 
-    The remote host bridges to Ollama's ``/api/generate`` (a plain-text prompt),
-    so chat-style message lists are rendered into a simple, readable transcript
-    ending with an ``Assistant:`` cue.  ``system`` messages are emitted first as
-    context; ``user``/``assistant`` turns follow in order.
+    The remote host bridges to prompt-style completion endpoints, so chat-style
+    message lists are rendered into a simple, readable transcript ending with
+    an ``Assistant:`` cue (see :func:`keytalk.backends.messages_to_prompt`).
+    ``tools`` - the request's tool definitions - add an instruction block
+    teaching the plaintext call syntax :func:`keytalk.toolcalls.
+    parse_text_tool_calls` reads back into structured ``tool_calls``, so
+    tool-calling survives even prompt-only backends.
     """
 
-    systems: List[str] = []
-    turns: List[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role", "user")).strip().lower()
-        content = message.get("content", "")
-        if content is None:
-            content = ""
-        content = str(content)
-        if role == "system":
-            if content:
-                systems.append(content)
-        elif role == "assistant":
-            turns.append(f"Assistant: {content}")
-        else:  # treat anything else (user/tool/...) as a user turn
-            turns.append(f"User: {content}")
-
-    parts: List[str] = []
-    if systems:
-        parts.append("\n".join(systems))
-    parts.extend(turns)
-    body = "\n".join(parts)
-    # Cue the model to produce the assistant's next turn.
-    if body:
-        return f"{body}\nAssistant:"
-    return "Assistant:"
+    return messages_to_prompt(messages, tools)
 
 
 def _now_iso() -> str:
@@ -148,6 +131,40 @@ async def _close_quietly(stream: object) -> None:
         await aclose()
     except Exception:  # noqa: BLE001 - best effort on an already-failing path
         logger.debug("failed to close response stream", exc_info=True)
+
+
+async def _drain(
+    pieces: object,
+    on_piece: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> Tuple[List[str], Optional[BaseException]]:
+    """Run a response stream to exhaustion, collecting its text pieces.
+
+    ``on_piece`` is awaited for each non-empty piece as it arrives, so a
+    streaming handler can forward it without buffering the whole reply.
+    Returns ``(pieces, failure)`` where ``failure`` is the exception the
+    stream raised, or ``None`` when it completed normally - each endpoint
+    reports a failure in its own wire format, so the caller decides.
+
+    The stream is always closed, which is what makes an abandoned request tell
+    the host to stop generating.
+    """
+
+    parts: List[str] = []
+    failure: Optional[BaseException] = None
+    try:
+        async for piece in pieces:  # type: ignore[union-attr]
+            if not piece:
+                continue
+            parts.append(piece)
+            if on_piece is not None:
+                await on_piece(piece)
+    except asyncio.CancelledError:  # pragma: no cover - teardown path
+        raise
+    except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+        failure = exc
+    finally:
+        await _close_quietly(pieces)
+    return parts, failure
 
 
 class _Request:
@@ -538,7 +555,7 @@ class OllamaBridgeServer:
 
         await self._stream_completion(
             request, writer, self._request_stream(prompt=prompt), model,
-            bool(stream), envelope, "response"
+            bool(stream), envelope,
         )
 
     async def _handle_chat(
@@ -559,6 +576,11 @@ class OllamaBridgeServer:
         )
         model = str(payload.get("model") or self._model)
         stream = payload.get("stream", True)
+        params = self._tool_params(payload)
+        pieces = ToolCallExtractor(
+            self._request_stream(messages=messages, params=params),
+            params.get("tools"),
+        )
 
         def envelope(piece: str, done: bool) -> Dict[str, object]:
             obj: Dict[str, object] = {
@@ -568,12 +590,18 @@ class OllamaBridgeServer:
                 "done": done,
             }
             if done:
-                obj["done_reason"] = "stop"
+                calls = self._collect_tool_calls(pieces, params.get("tools"))
+                if calls:
+                    # Ollama carries tool calls beside the content, never in it.
+                    obj["message"]["tool_calls"] = tool_calls_to_ollama(calls)  # type: ignore[index]
+                    obj["done_reason"] = "tool_calls"
+                else:
+                    obj["done_reason"] = "stop"
             return obj
 
         await self._stream_completion(
-            request, writer, self._request_stream(messages=messages), model,
-            bool(stream), envelope, "message"
+            request, writer, pieces, model,
+            bool(stream), envelope,
         )
 
     async def _handle_openai_chat(
@@ -600,7 +628,8 @@ class OllamaBridgeServer:
         messages: List[Dict[str, object]] = (
             raw_messages if isinstance(raw_messages, list) else []
         )
-        prompt = build_prompt_from_messages(messages)
+        params = self._tool_params(payload)
+        prompt = build_prompt_from_messages(messages, tools=params.get("tools"))  # type: ignore[arg-type]
         model = str(payload.get("model") or self._model)
         stream = payload.get("stream", True)
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -612,16 +641,20 @@ class OllamaBridgeServer:
             len(messages),
             len(prompt),
         )
-
+        pieces = ToolCallExtractor(
+            self._request_stream(messages=messages, params=params),
+            params.get("tools"),
+        )
+        tools = params.get("tools")
         if stream:
             await self._stream_openai(
-                request, writer, self._request_stream(messages=messages),
-                model, completion_id, created
+                request, writer, pieces,
+                model, completion_id, created, tools,
             )
         else:
             await self._aggregate_openai(
-                request, writer, self._request_stream(messages=messages),
-                model, completion_id, created
+                request, writer, pieces,
+                model, completion_id, created, tools,
             )
 
     @staticmethod
@@ -663,6 +696,7 @@ class OllamaBridgeServer:
         model: str,
         completion_id: str,
         created: int,
+        tools: Optional[List[dict]] = None,
     ) -> None:
         await self._begin_sse(writer, request.keep_alive)
         await self._write_sse(
@@ -674,38 +708,39 @@ class OllamaBridgeServer:
         count = 0
         chars = 0
         error_text: Optional[str] = None
-        try:
-            async for piece in pieces:
-                if not piece:
-                    continue
-                count += 1
-                chars += len(piece)
-                await self._write_sse(
-                    writer,
-                    self._openai_chunk(
-                        completion_id, created, model, {"content": piece}, None
-                    ),
-                )
-        except asyncio.CancelledError:  # pragma: no cover - teardown path
-            raise
-        except Exception as exc:  # noqa: BLE001 - surface any backend failure
+
+        async def _forward(piece: str) -> None:
+            nonlocal count, chars
+            count += 1
+            chars += len(piece)
+            await self._write_sse(
+                writer,
+                self._openai_chunk(
+                    completion_id, created, model, {"content": piece}, None
+                ),
+            )
+
+        _, failure = await _drain(pieces, _forward)
+        if failure is not None:
             logger.exception("error streaming OpenAI completion")
-            error_text = self._format_bridge_error(exc)
-        finally:
-            await _close_quietly(pieces)
+            error_text = self._format_bridge_error(failure)
 
         if error_text is None and count == 0:
-            logger.warning(
-                "/v1/chat/completions produced no content from the host "
-                "(empty stream); returning a placeholder message"
-            )
-            error_text = self._format_bridge_error(
-                RuntimeError("the host returned no output for this prompt")
-            )
+            calls_probe = self._collect_tool_calls(pieces, tools)
+            if not calls_probe:
+                logger.warning(
+                    "/v1/chat/completions produced no content from the host "
+                    "(empty stream); returning a placeholder message"
+                )
+                error_text = self._format_bridge_error(
+                    RuntimeError("the host returned no output for this prompt")
+                )
 
-        # Always emit a content chunk + a "stop" finish_reason so the response
-        # is a valid OpenAI choice; on failure the error text rides along as the
-        # message content instead of aborting the stream.
+        # Always emit a content chunk + a finish_reason so the response is a
+        # valid OpenAI choice; on failure the error text rides along as the
+        # message content instead of aborting the stream.  Tool calls ride as
+        # a ``tool_calls`` delta with ``finish_reason: "tool_calls"``, exactly
+        # like a local tool-aware server - never as assistant text.
         if error_text is not None:
             await self._write_sse(
                 writer,
@@ -713,17 +748,33 @@ class OllamaBridgeServer:
                     completion_id, created, model, {"content": error_text}, None
                 ),
             )
+        calls = self._collect_tool_calls(pieces, tools)
+        finish_reason = "stop"
+        if calls and error_text is None:
+            await self._write_sse(
+                writer,
+                self._openai_chunk(
+                    completion_id,
+                    created,
+                    model,
+                    {"tool_calls": self._tool_call_deltas(calls)},
+                    None,
+                ),
+            )
+            finish_reason = "tool_calls"
         await self._write_sse(
             writer,
             self._with_timings(
-                self._openai_chunk(completion_id, created, model, {}, "stop")
+                self._openai_chunk(completion_id, created, model, {}, finish_reason),
+                pieces,
             ),
         )
         if error_text is None:
             logger.info(
-                "/v1/chat/completions streamed %d pieces (%d chars)",
+                "/v1/chat/completions streamed %d pieces (%d chars, %d tool calls)",
                 count,
                 chars,
+                len(calls),
             )
         await self._write_sse_done(writer)
         await self._end_chunked(writer)
@@ -736,27 +787,25 @@ class OllamaBridgeServer:
         model: str,
         completion_id: str,
         created: int,
+        tools: Optional[List[dict]] = None,
     ) -> None:
-        parts: List[str] = []
+        parts, failure = await _drain(pieces)
         error_text: Optional[str] = None
-        try:
-            async for piece in pieces:
-                if piece:
-                    parts.append(piece)
-        except asyncio.CancelledError:  # pragma: no cover - teardown path
-            raise
-        except Exception as exc:  # noqa: BLE001 - surface any backend failure
+        if failure is not None:
             logger.exception("error generating OpenAI completion")
-            error_text = self._format_bridge_error(exc)
-        finally:
-            await _close_quietly(pieces)
+            error_text = self._format_bridge_error(failure)
 
         text = "".join(parts)
+        calls = self._collect_tool_calls(pieces, tools) if error_text is None else []
         finish_reason = "stop"
+        message: Dict[str, object] = {"role": "assistant", "content": text}
+        if calls:
+            message["tool_calls"] = calls
+            finish_reason = "tool_calls"
         if error_text is not None:
             # Deliver the failure as assistant content (keeping the bridge alive
             # for the next request) rather than a 500 that aborts the client.
-            text = error_text
+            message["content"] = error_text
             finish_reason = "error"
         obj: Dict[str, object] = {
             "id": completion_id,
@@ -766,7 +815,7 @@ class OllamaBridgeServer:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
+                    "message": message,
                     "finish_reason": finish_reason,
                 }
             ],
@@ -776,7 +825,7 @@ class OllamaBridgeServer:
                 "total_tokens": 0,
             },
         }
-        self._with_timings(obj)
+        self._with_timings(obj, pieces)
         await self._write_json(
             writer, 200, obj, keep_alive=request.keep_alive
         )
@@ -804,25 +853,96 @@ class OllamaBridgeServer:
         *,
         prompt: Optional[str] = None,
         messages: Optional[List[Dict[str, object]]] = None,
-    ):
-        """Open the appropriate response stream for a request.
+        params: Optional[Dict[str, object]] = None,
+    ) -> "AsyncIterator[str]":
+        """Open the response stream for a request, wrapped for the envelope.
+
+        When the request offers ``tools`` the stream is wrapped in a
+        :class:`~keytalk.toolcalls.ToolCallExtractor` so plaintext invocations
+        can be lifted out of the prose; a request without tools is passed
+        through untouched (filtering prose that cannot contain a call would
+        only risk mangling it).  Either way the envelope reads this request's
+        own tool calls and generation stats off the returned stream, never off
+        shared client state.
 
         When the client supports structured chat (``chat_stream``), messages
-        are passed through untouched so the remote backend can render its
-        model's own chat template; otherwise they are flattened into a prompt.
+        are passed through untouched (so the remote backend can render its
+        model's own chat template) along with ``params`` - notably ``tools`` /
+        ``tool_choice``, which reach the model as native tool definitions;
+        otherwise they are flattened into a prompt that teaches the plaintext
+        tool-call syntax the bridge parses back.
         """
 
+        source: object
         if messages is not None:
             chat_stream = getattr(self._client, "chat_stream", None)
             if chat_stream is not None:
-                return chat_stream(messages)
-            prompt = build_prompt_from_messages(messages)
-        return self._client.stream(prompt or "")
+                source = chat_stream(messages, **dict(params or {}))
+            else:
+                prompt = build_prompt_from_messages(
+                    messages, tools=(params or {}).get("tools")  # type: ignore[arg-type]
+                )
+                source = self._client.stream(prompt)
+        else:
+            source = self._client.stream(prompt or "")
+        tools = (params or {}).get("tools")
+        if not tools:
+            return source  # type: ignore[return-value]
+        return ToolCallExtractor(source, tools)  # type: ignore[arg-type]
 
-    def _with_timings(self, obj: Dict[str, object]) -> Dict[str, object]:
-        """Attach server-side generation stats (if any) to a final envelope."""
+    @staticmethod
+    def _tool_params(payload: Dict[str, object]) -> Dict[str, object]:
+        """Extract the tool-calling parameters to forward to the remote host."""
 
-        timings = getattr(self._client, "last_timings", None)
+        params: Dict[str, object] = {}
+        tools = payload.get("tools")
+        if isinstance(tools, list) and tools:
+            params["tools"] = tools
+        tool_choice = payload.get("tool_choice")
+        if tool_choice is not None:
+            params["tool_choice"] = tool_choice
+        return params
+
+    def _collect_tool_calls(
+        self, pieces: object, tools: Optional[object] = None
+    ) -> List[Dict[str, object]]:
+        """Tool calls for *this* request, in strict OpenAI shape.
+
+        Plaintext calls (``<function=...>`` markup) are extracted by the
+        :class:`~keytalk.toolcalls.ToolCallExtractor` wrapping the stream;
+        structured calls made through a backend's native tool channel arrive in
+        the request's own meta trailer.  Both are read from the request's
+        stream, never from shared client state, so concurrent requests cannot
+        pick up each other's calls.  Only requests that actually offered tools
+        can produce calls.
+        """
+
+        if not tools:
+            return []
+        return normalize_tool_calls(getattr(pieces, "tool_calls", None) or [])
+
+    @staticmethod
+    def _tool_call_deltas(calls: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        """Render tool calls as OpenAI streaming ``delta.tool_calls`` fragments."""
+
+        return [
+            {
+                "index": index,
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["function"]["name"],  # type: ignore[index]
+                    "arguments": call["function"]["arguments"],  # type: ignore[index]
+                },
+            }
+            for index, call in enumerate(calls)
+        ]
+
+    @staticmethod
+    def _with_timings(obj: Dict[str, object], pieces: object) -> Dict[str, object]:
+        """Attach *this request's* server-side generation stats to a final envelope."""
+
+        timings = getattr(pieces, "timings", None)
         if timings:
             obj["timings"] = timings
         return obj
@@ -835,13 +955,12 @@ class OllamaBridgeServer:
         model: str,
         stream: bool,
         envelope: Callable[[str, bool], Dict[str, object]],
-        aggregate_field: str,
     ) -> None:
         if stream:
             await self._stream_ndjson(request, writer, pieces, envelope)
         else:
             await self._aggregate_completion(
-                request, writer, pieces, envelope, aggregate_field
+                request, writer, pieces, envelope
             )
 
     async def _stream_ndjson(
@@ -854,25 +973,22 @@ class OllamaBridgeServer:
         # Headers are flushed before the model produces anything, so any error
         # must be reported in-band as an Ollama-style ``{"error": ...}`` line.
         await self._begin_chunked(writer, request.keep_alive)
-        try:
-            async for piece in pieces:
-                if not piece:
-                    continue
-                await self._write_chunk_json(writer, envelope(piece, False))
-            await self._write_chunk_json(
-                writer, self._with_timings(envelope("", True))
-            )
-        except asyncio.CancelledError:  # pragma: no cover - teardown path
-            raise
-        except Exception as exc:  # noqa: BLE001 - surface any backend failure
+
+        async def _forward(piece: str) -> None:
+            await self._write_chunk_json(writer, envelope(piece, False))
+
+        _, failure = await _drain(pieces, _forward)
+        if failure is not None:
             logger.exception("error streaming completion")
             # Include done=true so clients using Symbol.asyncIterator don't
             # throw "Did not receive done or success response in stream".
             final = envelope("", True)
-            final["error"] = str(exc)
+            final["error"] = str(failure)
             await self._write_chunk_json(writer, final)
-        finally:
-            await _close_quietly(pieces)
+        else:
+            await self._write_chunk_json(
+                writer, self._with_timings(envelope("", True), pieces)
+            )
         await self._end_chunked(writer)
 
     async def _aggregate_completion(
@@ -881,29 +997,17 @@ class OllamaBridgeServer:
         writer: asyncio.StreamWriter,
         pieces,
         envelope: Callable[[str, bool], Dict[str, object]],
-        aggregate_field: str,
     ) -> None:
-        parts: List[str] = []
-        try:
-            async for piece in pieces:
-                if piece:
-                    parts.append(piece)
-        except asyncio.CancelledError:  # pragma: no cover - teardown path
-            raise
-        except Exception as exc:  # noqa: BLE001 - surface any backend failure
+        parts, failure = await _drain(pieces)
+        if failure is not None:
             logger.exception("error generating completion")
             await self._write_json(
-                writer, 500, {"error": str(exc)}, keep_alive=request.keep_alive
+                writer, 500, {"error": str(failure)}, keep_alive=request.keep_alive
             )
             return
-        finally:
-            await _close_quietly(pieces)
 
         text = "".join(parts)
-        obj = self._with_timings(envelope(text, True))
-        # For non-streaming chat the assistant content carries the whole text;
-        # for generate the ``response`` field does.  ``envelope`` placed the
-        # text via its first argument, so the full payload is already correct.
+        obj = self._with_timings(envelope(text, True), pieces)
         await self._write_json(
             writer, 200, obj, keep_alive=request.keep_alive
         )

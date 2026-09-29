@@ -163,9 +163,13 @@ class PlatformGlueTests(unittest.TestCase):
     @unittest.skipUnless(CBL2CAP_AVAILABLE, "PyObjC CoreBluetooth L2CAP not available")
     def test_macos_selectors_exist(self):
         # Pin the glue to the real API surface (verified bindings, not docs).
-        import CoreBluetooth  # noqa: F401 - loads the framework bundle
+        # The skipUnless guard already proved the framework is loadable; import
+        # it explicitly so a broken PyObjC install fails loudly here.
+        import CoreBluetooth
+
         import objc
 
+        self.assertTrue(CoreBluetooth is not None)
         manager = objc.lookUpClass("CBPeripheralManager")
         peripheral = objc.lookUpClass("CBPeripheral")
         channel = objc.lookUpClass("CBL2CAPChannel")

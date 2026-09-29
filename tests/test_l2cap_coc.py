@@ -8,30 +8,25 @@ are sent directly over the reliable stream.
 from __future__ import annotations
 
 import asyncio
-import struct
 import time
 import unittest
 
 from keytalk.backends import StaticBackend
 from keytalk.ble.l2cap import L2CAPLoopbackTransport, create_l2cap_loopback
-from keytalk.ble.l2cap.channel import L2CAPStreamTransport, _LEN_SIZE, _LEN_STRUCT
 from keytalk.consumer import ConsumerClient
 from keytalk.host import HostService
 from keytalk.modes import (
     L2CAP_COC_PROFILE,
-    LEGACY_PROFILE,
     Mode,
     make_l2cap_coc_profile,
     profile_for_mode,
 )
 from keytalk.protocol import (
-    DEFAULT_ATT_MTU,
-    Flags,
     Frame,
     MessageType,
     max_payload_for_mtu,
 )
-from keytalk.transport import InMemoryTransport, create_loopback
+from keytalk.transport import create_loopback
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -218,7 +213,6 @@ class L2CAPCOCIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(consumer._profile.mode, Mode.L2CAP_COC)
 
     async def test_response_correct_after_multiple_requests(self):
-        responses = ["first", "second", "third"]
         host_t, consumer_t = await create_l2cap_loopback()
         profile = make_l2cap_coc_profile(_L2CAP_MTU)
 

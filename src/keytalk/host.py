@@ -19,6 +19,9 @@ Reliability and recovery:
   consumer's HTTP client disconnects), freeing the LLM for the next request.
 * A HELLO message lets the consumer negotiate the frame payload size once the
   real BLE MTU is known (the default ATT MTU only fits 13 payload bytes/frame).
+  Both HELLO and SELECT are clamped by :attr:`HostService.max_mtu`, so a peer
+  claiming an impossible link MTU cannot inflate the frames past what the
+  radio can carry.
 * Responses are zlib-compressed incrementally; ERROR frames switch to plain
   text after the compressed stream is flushed.
 """
@@ -30,6 +33,7 @@ import json
 import logging
 import time
 import zlib
+from dataclasses import replace
 from typing import Dict, List, Optional, Set
 
 from .backends import LLMBackend, messages_to_prompt
@@ -62,9 +66,40 @@ from .protocol import (
 from .reliability import ReliableSender
 from .transport import Transport
 
-__all__ = ["HostService"]
+__all__ = ["HostService", "DEFAULT_MAX_MTU"]
 
 logger = logging.getLogger("keytalk.host")
+
+#: Largest link MTU keytalk will negotiate, whatever a peer claims.  BLE ATT
+#: tops out at 517 (BLE 4.2 DLE) and the stream modes (L2CAP CoC / RFCOMM)
+#: default to 1024, so this covers every real profile with headroom while
+#: still bounding what a buggy or hostile consumer can do.  Raise it via the
+#: ``max_mtu`` constructor argument if you run over a larger pipe.
+DEFAULT_MAX_MTU = 1024
+
+
+def _stream_meta(stream) -> Optional[dict]:
+    """Collect a backend stream's out-of-band metadata for the trailer.
+
+    Backends that wrap their generator (:class:`~keytalk.backends.TokenStream`)
+    report generation stats (``timings``), structured ``tool_calls`` and the
+    ``finish_reason``; plain async generators report none.  Only present keys
+    end up in the trailer payload.
+    """
+
+    meta: dict = {}
+    timings = getattr(stream, "timings", None)
+    if isinstance(timings, dict) and timings:
+        meta["timings"] = timings
+    tool_calls = getattr(stream, "tool_calls", None)
+    if isinstance(tool_calls, list) and tool_calls:
+        meta["tool_calls"] = tool_calls
+    finish_reason = getattr(stream, "finish_reason", None)
+    if isinstance(finish_reason, str) and finish_reason:
+        meta["finish_reason"] = finish_reason
+    elif "tool_calls" in meta:
+        meta["finish_reason"] = "tool_calls"
+    return meta or None
 
 
 class _OutboundMessage:
@@ -130,6 +165,7 @@ class HostService:
         buffer_response: bool = False,
         mtu: int = DEFAULT_ATT_MTU,
         max_payload_size: Optional[int] = None,
+        max_mtu: int = DEFAULT_MAX_MTU,
         compress_responses: bool = True,
         window: Optional[int] = None,
         rto: float = 0.75,
@@ -148,13 +184,22 @@ class HostService:
         )
         if self._max_payload <= 0:
             raise ValueError("max_payload_size must be positive")
-        # Cap for HELLO negotiation: never emit frames larger than this even if
-        # the consumer claims a bigger link MTU.
+        if not DEFAULT_ATT_MTU <= max_mtu <= 0xFFFF:
+            raise ValueError(
+                f"max_mtu must be in [{DEFAULT_ATT_MTU}, 65535], got {max_mtu}"
+            )
+        self._max_mtu = max_mtu
+        # Hard ceiling on any frame the host will emit, whatever a peer claims
+        # in HELLO or SELECT.  This is a constant, not a running maximum.
+        self._max_payload_ceiling = max_payload_for_mtu(max_mtu)
+        # Cap for HELLO negotiation: the size in force when the link came up,
+        # so a peer can still shrink it to match the real MTU.
         self._max_payload_cap = self._max_payload
         self._compress_responses = compress_responses
         # A profile with reliability_window=0 marks a reliable stream transport
         # (L2CAP CoC / RFCOMM) where Go-Back-N is unnecessary; the pump still
         # works there (nothing drops), so fall back to a sane window size.
+        self._window_explicit = window is not None
         self._window = (
             window
             if window is not None
@@ -166,11 +211,14 @@ class HostService:
         self._reassembler = Reassembler()
         self._tasks: Set["asyncio.Task[None]"] = set()
         self._messages: Dict[int, _OutboundMessage] = {}
-        # Reliable senders used by the buffered/FAST_GATT handlers (which do
-        # not use the _OutboundMessage pump).
-        self._senders: Dict[int, ReliableSender] = {}
         self._gen_tasks: Dict[int, "asyncio.Task[None]"] = {}
         self._started = False
+
+    @property
+    def max_mtu(self) -> int:
+        """The largest link MTU this host will negotiate (see :data:`DEFAULT_MAX_MTU`)."""
+
+        return self._max_mtu
 
     async def start(self) -> None:
         """Register the frame handler and bring the transport up."""
@@ -218,11 +266,7 @@ class HostService:
                 if state.sender is not None:
                     state.sender.on_ack(frame.seq)
             else:
-                sender = self._senders.get(frame.message_id)
-                if sender is not None:
-                    sender.on_ack(frame.seq)
-                else:
-                    logger.debug("ACK for unknown message %s", frame.message_id)
+                logger.debug("ACK for unknown message %s", frame.message_id)
             return
 
         # SELECT arrives before any prompts and configures the mode for this
@@ -252,48 +296,49 @@ class HostService:
             logger.exception("dropping malformed control message")
 
     async def _handle_message(self, message) -> None:  # noqa: ANN001
-        if message.msg_type == MessageType.PROMPT:
-            if message.message_id in self._messages:
-                # A duplicated prompt (e.g. a write retried across a reconnect)
-                # must not start a second generation for the same request.
+        if message.msg_type in (
+            MessageType.PROMPT,
+            MessageType.CHAT,
+            MessageType.LIST_MODELS,
+        ):
+            kind = message.msg_type.name.lower()
+            # Reserve the id *synchronously*, before the handler task runs: a
+            # duplicated write (retried across a reconnect) that arrives in the
+            # same event-loop tick must still see the id as taken.  Reserving
+            # inside the task body would let N duplicates all slip through.
+            state = self._reserve(message.message_id)
+            if state is None:
                 logger.warning(
-                    "duplicate prompt for message %s; ignoring", message.message_id
-                )
-                return
-            logger.info(
-                "Received complete prompt (msg_id=%d): %r",
-                message.message_id,
-                message.text()[:100],
-            )
-            self._purge_messages()
-            self._spawn(
-                self._handle_prompt(message.message_id, message.text()),
-                message_id=message.message_id,
-            )
-        elif message.msg_type == MessageType.CHAT:
-            if message.message_id in self._messages:
-                logger.warning(
-                    "duplicate chat request for message %s; ignoring",
+                    "duplicate %s for message %s; ignoring",
+                    kind,
                     message.message_id,
                 )
                 return
             self._purge_messages()
-            self._spawn(
-                self._handle_chat(message.message_id, message.payload),
-                message_id=message.message_id,
-            )
-        elif message.msg_type == MessageType.LIST_MODELS:
-            if message.message_id in self._messages:
-                logger.warning(
-                    "duplicate model-list request for %s; ignoring",
+            if message.msg_type == MessageType.PROMPT:
+                logger.info(
+                    "Received complete prompt (msg_id=%d): %r",
+                    message.message_id,
+                    message.text()[:100],
+                )
+                self._spawn(
+                    self._handle_prompt(state, message.text()),
+                    message_id=message.message_id,
+                )
+            elif message.msg_type == MessageType.CHAT:
+                logger.info(
+                    "Received chat request (msg_id=%d)",
                     message.message_id,
                 )
-                return
-            self._purge_messages()
-            self._spawn(
-                self._handle_list_models(message.message_id),
-                message_id=message.message_id,
-            )
+                self._spawn(
+                    self._handle_chat(state, message.payload),
+                    message_id=message.message_id,
+                )
+            else:
+                self._spawn(
+                    self._handle_list_models(state),
+                    message_id=message.message_id,
+                )
         elif message.msg_type == MessageType.HELLO:
             self._handle_hello(message.payload)
         elif message.msg_type == MessageType.RESUME:
@@ -323,13 +368,21 @@ class HostService:
         except ValueError:
             logger.warning("SELECT: unknown mode_id %d — staying on legacy", mode_id)
             return
+        # The peer's MTU claim is untrusted input: clamp it to the link range
+        # before it can size any frame.
+        mtu = max(DEFAULT_ATT_MTU, min(reported_mtu, self._max_mtu))
+        if mtu != reported_mtu:
+            logger.warning(
+                "SELECT: consumer reported MTU %d, clamped to %d (max_mtu)",
+                reported_mtu, mtu,
+            )
         try:
             if mode == Mode.FAST_GATT:
-                new_profile = make_fast_gatt_profile(reported_mtu)
+                new_profile = make_fast_gatt_profile(mtu)
             elif mode == Mode.L2CAP_COC:
-                new_profile = make_l2cap_coc_profile(reported_mtu)
+                new_profile = make_l2cap_coc_profile(mtu)
             elif mode == Mode.CLASSIC_RFCOMM:
-                new_profile = make_classic_rfcomm_profile(reported_mtu)
+                new_profile = make_classic_rfcomm_profile(mtu)
             else:
                 new_profile = profile_for_mode(mode.value)
         except ValueError as exc:
@@ -337,11 +390,20 @@ class HostService:
             return
         prev_mode = self._profile.mode
         self._profile = new_profile
-        self._negotiated_mtu = reported_mtu
-        # Only resize response frames for modes that exploit larger MTUs.
+        self._negotiated_mtu = mtu
+        # Only resize response frames for modes that exploit larger MTUs, and
+        # never past the ceiling set at construction.  ``_max_payload_cap``
+        # tracks the size now in force so the HELLO that follows can still
+        # shrink it to the real link MTU.
         if new_profile.mode != Mode.LEGACY:
-            self._max_payload = max_payload_for_mtu(reported_mtu)
-            self._max_payload_cap = max(self._max_payload_cap, self._max_payload)
+            self._max_payload = min(
+                self._max_payload_ceiling, max_payload_for_mtu(mtu)
+            )
+            self._max_payload_cap = self._max_payload
+        if not self._window_explicit:
+            # A mode with reliability_window=0 marks a reliable stream
+            # transport; fall back to a sane window there.
+            self._window = self._profile.reliability_window or 64
         if prev_mode != new_profile.mode:
             logger.info(
                 "Bluetooth mode switched: %s → %s (consumer MTU=%d, max_payload=%d)",
@@ -363,10 +425,10 @@ class HostService:
     # -- control messages -----------------------------------------------------
 
     def _handle_hello(self, payload: bytes) -> None:
-        """Adopt the consumer's frame payload size (capped by ours)."""
+        """Adopt the consumer's frame payload size (clamped by ``max_mtu``)."""
 
         peer_max = decode_max_payload(payload)
-        new_max = min(self._max_payload_cap, peer_max)
+        new_max = min(self._max_payload_cap, self._max_payload_ceiling, peer_max)
         if new_max != self._max_payload:
             logger.info(
                 "frame payload negotiated: %d -> %d bytes", self._max_payload, new_max
@@ -443,14 +505,32 @@ class HostService:
             logger.warning("NACK skipped: message %s already streaming", message_id)
             return
         if state is None:
-            state = self._new_message(message_id)
+            state = self._reserve(message_id)
+            if state is None:
+                return  # another request claimed the id in the meantime
+            self._spawn_pump(state)
         await self._send_error_frames(state, None, message_id, text)
 
     # -- outbound message pumping ---------------------------------------------
 
-    def _new_message(self, message_id: int) -> _OutboundMessage:
+    def _reserve(self, message_id: int) -> Optional[_OutboundMessage]:
+        """Claim ``message_id`` for a new request, or return ``None`` if taken.
+
+        The reservation registers an :class:`_OutboundMessage` *without*
+        starting its delivery pump, so a caller can hand the reserved state to
+        a handler task.  This is what makes duplicate suppression atomic: the
+        id is claimed at dispatch time, before any handler runs.
+        """
+
+        if message_id in self._messages:
+            return None
         state = _OutboundMessage(message_id)
         self._messages[message_id] = state
+        return state
+
+    def _new_message(self, message_id: int) -> _OutboundMessage:
+        state = self._reserve(message_id)
+        assert state is not None  # callers check for an existing state first
         self._spawn_pump(state)
         return state
 
@@ -520,30 +600,37 @@ class HostService:
 
     # -- prompt handling ------------------------------------------------------
 
-    async def _handle_prompt(self, message_id: int, prompt: str) -> None:
+    async def _handle_prompt(self, state: _OutboundMessage, prompt: str) -> None:
         """Dispatch prompt handling on the negotiated transfer mode.
 
-        LEGACY and non-buffered FAST_GATT use the reliable message-pump path
-        (retransmission/RESUME/TIMINGS); the buffered and stream modes use the
-        mode-specific handlers kept from the transfer-mode work.
+        Streaming mode encodes tokens as they arrive (lowest latency); the
+        buffered mode waits for the whole reply and compresses it in one shot
+        (best ratio, no visible progress).  Both deliver through the same
+        reliable pump, so reliability is identical either way.
         """
 
+        message_id = state.message_id
         mode = self._profile.mode
         logger.info(
             "Prompt %d via %s (%d chars)", message_id, mode.value, len(prompt)
         )
+        buffered = self._buffer_response or mode in (
+            Mode.L2CAP_COC,
+            Mode.CLASSIC_RFCOMM,
+        )
+        self._spawn_pump(state)
         try:
-            if mode == Mode.FAST_GATT and self._buffer_response:
-                await self._handle_prompt_fast_gatt(message_id, prompt)
-            elif mode in (Mode.L2CAP_COC, Mode.CLASSIC_RFCOMM) and self._buffer_response:
-                await self._handle_prompt_stream(message_id, prompt)
+            if buffered:
+                await self._handle_prompt_buffered(state, prompt)
             else:
-                await self._handle_prompt_legacy(message_id, prompt)
+                await self._handle_prompt_streaming(state, prompt)
         finally:
             self._gen_tasks.pop(message_id, None)
 
-    async def _handle_prompt_legacy(self, message_id: int, prompt: str) -> None:
-        state = self._new_message(message_id)
+    async def _handle_prompt_streaming(
+        self, state: _OutboundMessage, prompt: str
+    ) -> None:
+        message_id = state.message_id
         encoder = FrameStreamEncoder(
             MessageType.RESPONSE,
             message_id,
@@ -563,160 +650,74 @@ class HostService:
         finally:
             self._gen_tasks.pop(message_id, None)
 
-    async def _handle_prompt_stream(self, message_id: int, prompt: str) -> None:
-        """Collect full response, compress, CRC32, send directly (L2CAP_COC / RFCOMM path).
+    async def _handle_prompt_buffered(
+        self, state: _OutboundMessage, prompt: str
+    ) -> None:
+        """Buffer the whole response, then compress+chunk it in one shot.
 
-        Both L2CAP COC and RFCOMM provide reliable ordered streams, so the
-        Go-Back-N ``ReliableSender`` is not needed; frames go to the transport directly.
+        Used by the transfer modes that favour a large transfer ratio over
+        visible streaming (``--buffer-response``, L2CAP CoC, RFCOMM).
+        Compressing the finished text beats the incremental encoder because
+        zlib can see the whole message, and the CRC32 trailer catches a
+        corrupt stream before it is handed to the model.
+
+        Delivery still goes through the normal :class:`_OutboundMessage` pump,
+        so buffered mode keeps the same guarantees as legacy: duplicate-request
+        suppression, frame retention for RESUME, cumulative ACKs and the
+        TIMINGS trailer.
         """
-        logger.info(
-            "msg_id=%d: buffering full response, then compress+chunk (%s)",
-            message_id, self._profile.mode.value,
-        )
-        encoder = FrameStreamEncoder(MessageType.RESPONSE, message_id, self._max_payload)
+        mode = self._profile.mode.value
+        message_id = state.message_id
+        logger.info("msg_id=%d: buffering full response (%s)", message_id, mode)
         try:
+            stream = self._backend.generate(prompt)
             parts: list[bytes] = []
-            async for fragment in self._backend.generate(prompt):
+            async for fragment in stream:
                 if fragment:
                     parts.append(fragment.encode("utf-8"))
-            full_response = b"".join(parts)
-            logger.debug(
-                "msg_id=%d: collected %d bytes, compressing...",
-                message_id, len(full_response),
-            )
-            compressed = zlib.compress(full_response, level=6)
-            if len(compressed) >= len(full_response):
-                wire_payload = full_response
-                use_compressed_flag = False
-            else:
-                wire_payload = compressed
-                use_compressed_flag = True
-
+            full = b"".join(parts)
+            compressed = zlib.compress(full, level=6)
+            # Only pay for compression when it actually shrinks the message.
+            wire = full if len(compressed) >= len(full) else compressed
+            meta = _stream_meta(stream)
             frames = chunk_message(
                 MessageType.RESPONSE,
                 message_id,
-                wire_payload,
+                wire,
                 self._max_payload,
                 checksum=True,
+                start_flags=(
+                    Flags.COMPRESSED if wire is not full else Flags.NONE
+                ),
             )
-            if use_compressed_flag and frames:
-                f0 = frames[0]
-                frames[0] = Frame(
-                    msg_type=f0.msg_type,
-                    message_id=f0.message_id,
-                    seq=f0.seq,
-                    payload=f0.payload,
-                    flags=f0.flags | Flags.COMPRESSED,
-                    version=f0.version,
+            if meta:
+                # The trailer carries END, so the response run must not close
+                # the message or the consumer would stop feeding before it.
+                frames[-1] = replace(
+                    frames[-1], flags=frames[-1].flags & ~Flags.END
                 )
             for frame in frames:
-                await self._transport.send(frame.encode())
+                state.append(frame)
+            if meta:
+                # chunk_message always emits a START frame, so the trailer
+                # never needs to open the message.
+                self._append_meta_trailer(state, started=True, meta=meta)
+            state.complete = True
+            state.event.set()
             logger.info(
                 "Completed %s prompt %s (%d raw bytes → %d wire bytes, %d frames)",
-                self._profile.mode.value,
-                message_id, len(full_response), len(wire_payload), len(frames),
+                mode, message_id, len(full), len(wire), state.end_seq - state.base,
             )
         except asyncio.CancelledError:
+            self._messages.pop(message_id, None)
             raise
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("backend failed for message %s (%s)", message_id, self._profile.mode.value)
-            # Send an error message directly without a ReliableSender.
-            payload = str(exc).encode("utf-8") or b"backend error"
-            pieces = [
-                payload[i : i + self._max_payload]
-                for i in range(0, len(payload), self._max_payload)
-            ] or [b""]
-            for idx, piece in enumerate(pieces):
-                flags = Flags.NONE
-                if idx == 0 and not encoder.has_started:
-                    flags |= Flags.START
-                if idx == len(pieces) - 1:
-                    flags |= Flags.END
-                await self._transport.send(
-                    Frame(
-                        msg_type=MessageType.ERROR,
-                        message_id=message_id,
-                        seq=encoder.next_seq + idx,
-                        payload=piece,
-                        flags=flags,
-                    ).encode()
-                )
-
-    # Keep the old name as an alias so existing test suites that reference it directly still pass.
-    # Historical names kept as aliases: the streaming variants now share the
-    # reliable message-pump pipeline (whole-stream compression, RESUME, TIMINGS).
-    _handle_prompt_l2cap_coc = _handle_prompt_stream
-    _handle_prompt_stream_chunked = _handle_prompt_legacy
-
-    async def _handle_prompt_fast_gatt(self, message_id: int, prompt: str) -> None:
-        """Collect full response, compress, checksum, then send (FAST_GATT path)."""
-        logger.info(
-            "msg_id=%d: buffering full response, then compress+chunk (FAST_GATT, window=%d)",
-            message_id, self._profile.reliability_window,
-        )
-        sender = ReliableSender(
-            self._transport.send,
-            window=self._profile.reliability_window,
-        )
-        self._senders[message_id] = sender
-        sender.start()
-        # Dummy encoder only used for _send_error path.
-        encoder = FrameStreamEncoder(MessageType.RESPONSE, message_id, self._max_payload)
-        try:
-            parts: list[bytes] = []
-            async for fragment in self._backend.generate(prompt):
-                if fragment:
-                    parts.append(fragment.encode("utf-8"))
-            full_response = b"".join(parts)
-            logger.debug(
-                "msg_id=%d: collected %d bytes, compressing...",
-                message_id, len(full_response),
-            )
-            # Compress the full response.
-            compressed = zlib.compress(full_response, level=6)
-            if len(compressed) >= len(full_response):
-                # Not worth it — send raw.
-                wire_payload = full_response
-                use_compressed_flag = False
-            else:
-                wire_payload = compressed
-                use_compressed_flag = True
-
-            frames = chunk_message(
-                MessageType.RESPONSE,
-                message_id,
-                wire_payload,
-                self._max_payload,
-                checksum=True,
-            )
-            # Set COMPRESSED on the START frame if the payload is compressed.
-            if use_compressed_flag and frames:
-                f0 = frames[0]
-                frames[0] = Frame(
-                    msg_type=f0.msg_type,
-                    message_id=f0.message_id,
-                    seq=f0.seq,
-                    payload=f0.payload,
-                    flags=f0.flags | Flags.COMPRESSED,
-                    version=f0.version,
-                )
-            for frame in frames:
-                await sender.send_frame(frame)
-            await sender.drain()
-            logger.info(
-                "Completed fast_gatt prompt %s (%d raw bytes → %d wire bytes, %d frames)",
-                message_id, len(full_response), len(wire_payload), len(frames),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("backend failed for message %s (fast_gatt)", message_id)
-            await self._send_error(sender, encoder, message_id, str(exc))
+        except Exception as exc:  # noqa: BLE001 - report any backend failure
+            logger.exception("backend failed for message %s (%s)", message_id, mode)
+            await self._send_error_frames(state, None, message_id, str(exc))
         finally:
-            sender.close()
-            self._senders.pop(message_id, None)
+            self._gen_tasks.pop(message_id, None)
 
-    async def _handle_chat(self, message_id: int, payload: bytes) -> None:
+    async def _handle_chat(self, state: _OutboundMessage, payload: bytes) -> None:
         """Handle a CHAT message: structured messages for the backend's template.
 
         Unlike PROMPT (a pre-rendered string), the payload is JSON of the form
@@ -726,6 +727,7 @@ class HostService:
         flattened transcript.
         """
 
+        message_id = state.message_id
         try:
             request = json.loads(payload.decode("utf-8")) if payload else {}
             if not isinstance(request, dict):
@@ -736,7 +738,7 @@ class HostService:
                 raise ValueError("params must be a JSON object")
         except (ValueError, UnicodeDecodeError) as exc:
             logger.warning("bad chat payload for message %s: %s", message_id, exc)
-            state = self._new_message(message_id)
+            self._spawn_pump(state)
             await self._send_error_frames(
                 state, None, message_id, f"bad chat payload: {exc}"
             )
@@ -746,7 +748,7 @@ class HostService:
             message_id,
             len(messages),
         )
-        state = self._new_message(message_id)
+        self._spawn_pump(state)
         encoder = FrameStreamEncoder(
             MessageType.RESPONSE,
             message_id,
@@ -758,7 +760,9 @@ class HostService:
             if generate_messages is not None:
                 stream = generate_messages(messages, **params)
             else:
-                stream = self._backend.generate(messages_to_prompt(messages))
+                stream = self._backend.generate(
+                    messages_to_prompt(messages, tools=params.get("tools"))
+                )
             await self._generate_into(state, encoder, message_id, stream)
         except asyncio.CancelledError:
             self._messages.pop(message_id, None)
@@ -785,7 +789,7 @@ class HostService:
                 )
             for frame in encoder.push(fragment.encode("utf-8")):
                 state.append(frame)
-        self._finish_message(state, encoder, getattr(stream, "timings", None))
+        self._finish_message(state, encoder, _stream_meta(stream))
         logger.info(
             "Completed message %s (%d tokens generated)", message_id, token_count
         )
@@ -794,19 +798,19 @@ class HostService:
         self,
         state: _OutboundMessage,
         encoder: FrameStreamEncoder,
-        timings: Optional[dict] = None,
+        meta: Optional[dict] = None,
     ) -> None:
         """Emit the message tail: optional TIMINGS trailer, then the END frame.
 
-        When the backend reports timings (llama.cpp attaches generation stats,
-        incl. MTP draft acceptance), they ride along as plain-text TIMINGS
-        frames at the tail of the *same* message - after the compressed stream
-        is cut - so they are guaranteed to arrive before END and cannot race
-        the consumer's request teardown.  Timings are telemetry: if a trailer
-        frame is ever lost the consumer simply ends without stats.
+        When the backend reports metadata (llama.cpp generation stats incl. MTP
+        draft acceptance, structured ``tool_calls``, the ``finish_reason``) it
+        rides along as plain-text TIMINGS frames at the tail of the *same*
+        message - after the compressed stream is cut - so it is guaranteed to
+        arrive before END and cannot race the consumer's request teardown.
+        The trailer is telemetry/structured data: if a trailer frame is ever
+        lost the consumer simply ends without it.
         """
-
-        if not timings:
+        if not meta:
             for frame in encoder.finish():
                 state.append(frame)
         else:
@@ -815,36 +819,52 @@ class HostService:
             # path - the trailer is plain text).
             for frame in encoder.flush():
                 state.append(frame)
-            payload = json.dumps(
-                {"timings": timings}, separators=(",", ":")
-            ).encode("utf-8")
-            pieces = [
-                payload[i : i + self._max_payload]
-                for i in range(0, len(payload), self._max_payload)
-            ] or [b""]
-            last = len(pieces) - 1
-            for index, piece in enumerate(pieces):
-                flags = Flags.NONE
-                if index == 0 and not encoder.has_started:
-                    flags |= Flags.START
-                if index == last:
-                    flags |= Flags.END
-                state.append(
-                    Frame(
-                        msg_type=MessageType.TIMINGS,
-                        message_id=state.message_id,
-                        seq=state.end_seq,
-                        payload=piece,
-                        flags=flags,
-                    )
-                )
+            self._append_meta_trailer(
+                state, started=encoder.has_started, meta=meta
+            )
         state.complete = True
         state.event.set()
 
-    async def _handle_list_models(self, message_id: int) -> None:
+    def _append_meta_trailer(
+        self, state: _OutboundMessage, *, started: bool, meta: dict
+    ) -> None:
+        """Append the plain-text ``TIMINGS`` trailer to the tail of ``state``.
+
+        Telemetry and structured data (llama.cpp generation stats incl. MTP
+        draft acceptance, ``tool_calls``, ``finish_reason``) ride as plain
+        frames at the very end of the *same* message - after any compressed
+        stream is cut - so they are guaranteed to arrive before END and cannot
+        race the consumer's request teardown.  The trailer is best-effort: if
+        one is ever lost the consumer simply ends without it.
+        """
+
+        payload = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        pieces = [
+            payload[i : i + self._max_payload]
+            for i in range(0, len(payload), self._max_payload)
+        ] or [b""]
+        last = len(pieces) - 1
+        for index, piece in enumerate(pieces):
+            flags = Flags.NONE
+            if index == 0 and not started:
+                flags |= Flags.START
+            if index == last:
+                flags |= Flags.END
+            state.append(
+                Frame(
+                    msg_type=MessageType.TIMINGS,
+                    message_id=state.message_id,
+                    seq=state.end_seq,
+                    payload=piece,
+                    flags=flags,
+                )
+            )
+
+    async def _handle_list_models(self, state: _OutboundMessage) -> None:
         """Answer a LIST_MODELS request with the backend's available models."""
 
-        state = self._new_message(message_id)
+        message_id = state.message_id
+        self._spawn_pump(state)
         encoder = FrameStreamEncoder(
             MessageType.RESPONSE,
             message_id,

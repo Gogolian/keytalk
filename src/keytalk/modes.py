@@ -1,11 +1,13 @@
 """Selectable transfer-mode profiles for keytalk.
 
-Phase 0: scaffolding only — Mode enum, ProfileConfig dataclass, and the
-LEGACY_PROFILE constant that mirrors the original hard-coded behaviour.  No
-existing code path is changed; all new code paths fall back to LEGACY_PROFILE.
+A :class:`ProfileConfig` bundles everything a transfer mode decides: the frame
+MTU, whether writes are acknowledged at the link layer, the compression codec,
+the flow-control scheme, and the reliability window.  ``Mode.LEGACY`` is the
+original hard-coded behaviour and is always available as the fallback.
 
-Phase 1: NegotiationError, mode-ID wire encoding, and negotiate_mode() which
-picks the best common mode from the host's CAPS advertisement.
+The consumer picks a mode by reading the host's CAPS characteristic
+(:func:`negotiate_mode`) and confirms it with a ``SELECT`` frame, so both ends
+agree for the lifetime of a connection.
 """
 
 from __future__ import annotations
@@ -32,8 +34,6 @@ __all__ = [
     "mode_for_id",
     "negotiate_mode",
 ]
-
-_UNIMPLEMENTED = "requested mode is not yet implemented"
 
 
 class Mode(str, Enum):
@@ -184,25 +184,29 @@ def mode_for_id(mid: int) -> Mode:
     return m
 
 
-def profile_for_mode(mode: str) -> ProfileConfig:
-    """Return the ProfileConfig for the requested mode string.
+# The default profile each mode ships with, keyed by the mode itself so
+# ``profile_for_mode`` stays a lookup rather than a growing if-chain.
+_DEFAULT_PROFILES: Dict[Mode, ProfileConfig] = {
+    Mode.LEGACY: LEGACY_PROFILE,
+    Mode.FAST_GATT: FAST_GATT_PROFILE,
+    Mode.L2CAP_COC: L2CAP_COC_PROFILE,
+    Mode.CLASSIC_RFCOMM: CLASSIC_RFCOMM_PROFILE,
+}
 
-    ``"auto"`` resolves to LEGACY until negotiation is implemented (Phase 1).
-    Raises ValueError for modes that are defined but not yet implemented.
+
+def profile_for_mode(mode: str) -> ProfileConfig:
+    """Return the default :class:`ProfileConfig` for a mode name.
+
+    ``"auto"`` resolves to :data:`LEGACY_PROFILE` until negotiation runs.
+    Raises ``ValueError`` for a mode name that does not exist.
     """
-    if mode in ("auto", "legacy"):
+
+    if mode == "auto":
         return LEGACY_PROFILE
     try:
-        m = Mode(mode)
-    except ValueError:
+        return _DEFAULT_PROFILES[Mode(mode)]
+    except (KeyError, ValueError):
         raise ValueError(f"unknown mode {mode!r}") from None
-    if m == Mode.FAST_GATT:
-        return FAST_GATT_PROFILE
-    if m == Mode.L2CAP_COC:
-        return L2CAP_COC_PROFILE
-    if m == Mode.CLASSIC_RFCOMM:
-        return CLASSIC_RFCOMM_PROFILE
-    return LEGACY_PROFILE  # unreachable, but keeps mypy happy
 
 
 def negotiate_mode(

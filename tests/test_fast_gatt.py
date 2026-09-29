@@ -4,11 +4,8 @@ CRC32 integrity, and an in-memory throughput benchmark.
 
 from __future__ import annotations
 
-import asyncio
-import struct
 import time
 import unittest
-import zlib
 
 from keytalk.backends import StaticBackend
 from keytalk.consumer import ConsumerClient

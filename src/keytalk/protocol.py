@@ -28,7 +28,6 @@ exactly one per frame, which lets the receiver detect drops or reordering.
 
 from __future__ import annotations
 
-import hashlib
 import struct
 import time
 import zlib
@@ -50,10 +49,7 @@ __all__ = [
     "chunk_message",
     "Reassembler",
     "FrameStreamEncoder",
-    "compute_message_checksum",
     "compute_crc32",
-    "encode_delta_payload",
-    "decode_delta_payload",
     "encode_select_payload",
     "decode_select_payload",
     "RESUME_UNKNOWN",
@@ -88,12 +84,14 @@ class MessageType(IntEnum):
     CANCEL = 4
     ACK = 5
     LIST_MODELS = 6
-    DELTA_PROMPT = 7  # Incremental prompt with checksum reference
+    # 7 = DELTA_PROMPT — reserved (unused; the value stays unallocated so it
+    #     can never be reassigned to a different meaning on the wire).
     # Phase 1 — capability handshake
-    HELLO = 8    # consumer → host: initiate handshake (reserved, not yet sent)
-    CAPS = 9     # host → consumer: capability advertisement
+    HELLO = 8    # consumer → host: frame payload size it can accept
+    CAPS = 9     # reserved: the host advertises modes on the CAPS GATT
+                #     characteristic instead of over the frame protocol
     SELECT = 10  # consumer → host: select a transfer mode
-    NAK = 11     # either direction: reject / signal mismatch (Phase 2+)
+    # 11 = NAK — reserved (failures ride on ERROR; see _send_nack)
     # Reliability / structured-request extensions (keytalk)
     PING = 12    # consumer → host: keepalive probe
     PONG = 13    # host → consumer: keepalive reply
@@ -115,7 +113,7 @@ class Flags(IntFlag):
     START = 1
     END = 2
     COMPRESSED = 4  # Payload is zlib-compressed
-    DELTA = 8       # Message is a delta (prefix + new content)
+    # 8 = DELTA — reserved (unused)
     CHECKSUM = 16   # END frame carries a 4-byte CRC32 trailer after the payload
 
 
@@ -200,7 +198,7 @@ class Frame:
             raise ProtocolError(f"unknown message type: {raw_type}") from exc
         # Flags is an IntFlag; reject bits we do not understand so that a
         # corrupted byte does not silently look like a valid boundary marker.
-        known = int(Flags.START | Flags.END | Flags.COMPRESSED | Flags.DELTA | Flags.CHECKSUM)
+        known = int(Flags.START | Flags.END | Flags.COMPRESSED | Flags.CHECKSUM)
         if raw_flags & ~known:
             raise ProtocolError(f"unknown flag bits set: {raw_flags:#04x}")
         return cls(
@@ -242,6 +240,7 @@ def chunk_message(
     max_payload_size: int,
     *,
     checksum: bool = False,
+    start_flags: Flags = Flags.NONE,
 ) -> List[Frame]:
     """Split ``payload`` into an ordered list of frames.
 
@@ -250,6 +249,9 @@ def chunk_message(
     is ``True``, a 4-byte CRC32 trailer is appended to the last frame's payload
     and the ``CHECKSUM`` flag is set on that frame; the :class:`Reassembler`
     verifies the trailer and strips it before returning the message.
+    ``start_flags`` are OR'd into the ``START`` frame (e.g. ``COMPRESSED``),
+    which is how whole-message metadata is attached without post-processing
+    the returned frames.
     """
 
     if max_payload_size <= 0:
@@ -276,7 +278,7 @@ def chunk_message(
     for seq, piece in enumerate(pieces):
         flags = Flags.NONE
         if seq == 0:
-            flags |= Flags.START
+            flags |= Flags.START | start_flags
         if seq == last:
             flags |= Flags.END
             if checksum:
@@ -567,43 +569,6 @@ class FrameStreamEncoder:
             self._emit(piece, last=(index == last))
             for index, piece in enumerate(pieces)
         ]
-
-
-def compute_message_checksum(data: bytes) -> str:
-    """Compute a SHA-256 checksum for message content.
-    
-    Returns the first 16 hex characters (64 bits) for bandwidth efficiency.
-    """
-    return hashlib.sha256(data).hexdigest()[:16]
-
-
-def encode_delta_payload(checksum_prefix: str, delta_content: bytes) -> bytes:
-    """Encode a delta message payload with checksum + new content.
-    
-    Format: <checksum_len><checksum><delta_content>
-    - checksum_len: 1 byte indicating length of checksum string
-    - checksum: UTF-8 encoded checksum string
-    - delta_content: the new bytes to append
-    """
-    checksum_bytes = checksum_prefix.encode('utf-8')
-    if len(checksum_bytes) > 255:
-        raise ValueError("Checksum too long")
-    return bytes([len(checksum_bytes)]) + checksum_bytes + delta_content
-
-
-def decode_delta_payload(payload: bytes) -> tuple[str, bytes]:
-    """Decode a delta message payload.
-    
-    Returns: (checksum_prefix, delta_content)
-    """
-    if len(payload) < 1:
-        raise ProtocolError("Delta payload too short")
-    checksum_len = payload[0]
-    if len(payload) < 1 + checksum_len:
-        raise ProtocolError("Delta payload truncated")
-    checksum = payload[1:1 + checksum_len].decode('utf-8')
-    delta_content = payload[1 + checksum_len:]
-    return checksum, delta_content
 
 
 # SELECT payload: 1-byte mode_id (uint8) + 2-byte MTU (uint16 big-endian).

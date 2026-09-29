@@ -6,33 +6,45 @@ chunks, and reads the streamed response chunks - no IP network involved.
 
 Public building blocks:
 
-* :class:`~keytalk.protocol` - transport-agnostic framing/chunking.
-* :class:`~keytalk.transport.Transport` and the in-memory loopback for tests.
-* :class:`~keytalk.backends.LLMBackend` (Ollama + test fakes).
-* :class:`~keytalk.host.HostService` and
-  :class:`~keytalk.consumer.ConsumerClient` - the two endpoints.
+* :mod:`keytalk.protocol` - transport-agnostic framing/chunking.
+* :mod:`keytalk.transport` - the ``Transport`` interface and the in-memory loopback.
+* :mod:`keytalk.backends` - the ``LLMBackend`` interface and its implementations
+  (Ollama, LM Studio, OpenRouter, llama.cpp, plus test fakes).
+* :mod:`keytalk.host` - ``HostService``: prompt frames -> LLM -> response frames.
+* :mod:`keytalk.consumer` - ``ConsumerClient``: prompt -> frames -> reply.
+* :mod:`keytalk.server` - the Ollama-compatible HTTP bridge (``--serve``).
 * :mod:`keytalk.ble` - real radio adapters (optional ``bleak``/``bless`` deps).
 """
 
 from __future__ import annotations
 
 from .backends import (
+    DummyFileBackend,
     EchoBackend,
+    LMStudioBackend,
+    LMStudioError,
     LlamaCppBackend,
     LlamaCppError,
     LLMBackend,
     OllamaBackend,
     OllamaError,
+    OpenRouterBackend,
+    OpenRouterError,
     StaticBackend,
     TokenStream,
     messages_to_prompt,
 )
-from .consumer import ConsumerClient, RemoteError
+from .consumer import ConsumerClient, RemoteError, ResponseStream
 from .host import HostService
 from .server import (
     OllamaBridgeServer,
     PromptStreamer,
     build_prompt_from_messages,
+)
+from .toolcalls import (
+    ToolCallExtractor,
+    normalize_tool_calls,
+    parse_text_tool_calls,
 )
 from .protocol import (
     CompleteMessage,
@@ -70,8 +82,13 @@ __all__ = [
     "LLMBackend",
     "EchoBackend",
     "StaticBackend",
+    "DummyFileBackend",
     "OllamaBackend",
     "OllamaError",
+    "LMStudioBackend",
+    "LMStudioError",
+    "OpenRouterBackend",
+    "OpenRouterError",
     "LlamaCppBackend",
     "LlamaCppError",
     "TokenStream",
@@ -79,9 +96,14 @@ __all__ = [
     # endpoints
     "HostService",
     "ConsumerClient",
+    "ResponseStream",
     "RemoteError",
     # ollama-compatible HTTP bridge
     "OllamaBridgeServer",
     "PromptStreamer",
     "build_prompt_from_messages",
+    # tool-call plumbing
+    "parse_text_tool_calls",
+    "normalize_tool_calls",
+    "ToolCallExtractor",
 ]

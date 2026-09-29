@@ -9,7 +9,7 @@ to hardware testing; this file provides the class interface so imports succeed.
 from __future__ import annotations
 
 import sys
-from typing import Any, Optional
+from typing import Any
 
 from .channel import L2CAPStreamTransport
 

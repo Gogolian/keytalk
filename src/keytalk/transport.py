@@ -15,6 +15,7 @@ import abc
 import asyncio
 import inspect
 import logging
+import time
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 from .protocol import DEFAULT_ATT_MTU
@@ -22,6 +23,10 @@ from .protocol import DEFAULT_ATT_MTU
 __all__ = ["Transport", "TransportClosed", "InMemoryTransport", "create_loopback"]
 
 logger = logging.getLogger("keytalk.transport")
+
+#: How long :meth:`Transport._shutdown_dispatch` lets the delivery worker
+#: finish an already-queued frame before cancelling it outright.
+DRAIN_TIMEOUT = 0.25
 
 ReceiveCallback = Callable[[bytes], Awaitable[None]]
 
@@ -79,16 +84,18 @@ class Transport(abc.ABC):
     async def _shutdown_dispatch(self, drain: bool = False) -> None:
         """Stop the ordered-delivery worker (and optionally flush the queue)."""
 
-        if drain:
+        worker = self._rx_worker
+        if drain and worker is not None and not self._rx_queue.empty():
             # Give queued frames a chance to be delivered before teardown so a
             # peer awaiting a response is not stranded by an abrupt close.
-            for _ in range(1000):
-                if self._rx_queue.empty():
-                    break
+            # Bounded by a wall-clock deadline rather than an iteration count,
+            # and deliberately not awaiting the worker itself: a frame whose
+            # callback blocks on a dead link must not hold up the close.
+            deadline = time.monotonic() + DRAIN_TIMEOUT
+            while not self._rx_queue.empty() and time.monotonic() < deadline:
                 await asyncio.sleep(0)
-        worker = self._rx_worker
-        self._rx_worker = None
         if worker is not None:
+            self._rx_worker = None
             worker.cancel()
             try:
                 await worker

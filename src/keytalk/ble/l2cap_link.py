@@ -311,13 +311,18 @@ def open_l2cap_socket(
 # asserted against the real bindings in tests/test_l2cap.py so this glue can
 # never silently rot against a PyObjC upgrade.
 try:  # pragma: no cover - exercised on macOS only
-    import CoreBluetooth  # noqa: F401 - loads the framework bundle
+    # Importing the framework bundle is the point: ``objc.lookUpClass`` cannot
+    # resolve CB* symbols until CoreBluetooth has been loaded.
+    import CoreBluetooth
+
     import objc
 
+    _CORE_BLUETOOTH_LOADED = CoreBluetooth is not None
     _CB_PERIPHERAL_MANAGER = objc.lookUpClass("CBPeripheralManager")
     _CB_L2CAP_CHANNEL = objc.lookUpClass("CBL2CAPChannel")
     CBL2CAP_AVAILABLE = (
-        hasattr(_CB_PERIPHERAL_MANAGER, MAC_PUBLISH_SELECTOR)
+        _CORE_BLUETOOTH_LOADED
+        and hasattr(_CB_PERIPHERAL_MANAGER, MAC_PUBLISH_SELECTOR)
         and hasattr(_CB_PERIPHERAL_MANAGER, "unpublishL2CAPChannel_")
         and hasattr(_CB_L2CAP_CHANNEL, "PSM")
         and hasattr(_CB_L2CAP_CHANNEL, "inputStream")

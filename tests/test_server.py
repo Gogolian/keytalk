@@ -13,7 +13,7 @@ import json
 import unittest
 from typing import AsyncIterator, Dict, List, Optional, Tuple
 
-from keytalk.backends import LLMBackend, StaticBackend
+from keytalk.backends import LLMBackend, StaticBackend, TokenStream
 from keytalk.consumer import ConsumerClient
 from keytalk.host import HostService
 from keytalk.server import (
@@ -104,6 +104,13 @@ class HTTPResponse:
             line = line.strip()
             if line:
                 objects.append(json.loads(line))
+        return objects
+
+    def sse(self) -> List[dict]:
+        objects = []
+        for line in self.body.decode("utf-8").splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                objects.append(json.loads(line[6:]))
         return objects
 
 
@@ -199,6 +206,24 @@ class ServerTestBase(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(server.close)
         return server
 
+    async def _make_full_stack(
+        self, backend: LLMBackend
+    ) -> Tuple[OllamaBridgeServer, HostService]:
+        """A real host + consumer over the loopback transport, plus the bridge.
+
+        Uses a deliberately tiny frame payload so responses span many frames
+        and exercise the chunking path.
+        """
+
+        host_t, consumer_t = create_loopback()
+        host = HostService(host_t, backend, max_payload_size=6)
+        consumer = ConsumerClient(consumer_t, max_payload_size=6, timeout=5.0)
+        await host.start()
+        await consumer.start()
+        self.addAsyncCleanup(host.close)
+        self.addAsyncCleanup(consumer.close)
+        return await self._serve(consumer, model="bridged"), host
+
 
 # --------------------------------------------------------------------------- #
 # build_prompt_from_messages
@@ -236,8 +261,56 @@ class PromptBuildingTests(unittest.TestCase):
         self.assertEqual(out, "A.\nB.\nUser: go\nAssistant:")
 
     def test_unknown_role_treated_as_user(self):
-        out = build_prompt_from_messages([{"role": "tool", "content": "x"}])
+        out = build_prompt_from_messages([{"role": "narrator", "content": "x"}])
         self.assertEqual(out, "User: x\nAssistant:")
+
+    def test_tool_result_rendered_as_tool_line(self):
+        out = build_prompt_from_messages(
+            [{"role": "tool", "content": "found it", "tool_call_id": "call_0"}]
+        )
+        self.assertEqual(out, "Tool result (call_0): found it\nAssistant:")
+
+    def test_assistant_tool_calls_rendered_as_calls(self):
+        out = build_prompt_from_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_0",
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query": "x"}',
+                            },
+                        }
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(
+            out,
+            "Assistant: <function=search>{\"query\": \"x\"}</function>\nAssistant:",
+        )
+
+    def test_tools_add_instruction_section(self):
+        out = build_prompt_from_messages(
+            [{"role": "user", "content": "hi"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "search the web",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        self.assertIn("<function=tool_name>", out)
+        self.assertIn("- search: search the web", out)
+        self.assertTrue(out.endswith("User: hi\nAssistant:"))
 
     def test_missing_and_none_content(self):
         out = build_prompt_from_messages(
@@ -726,19 +799,6 @@ async def _async_list(items: List[str]) -> List[str]:
 
 
 class EndToEndPipelineTests(ServerTestBase):
-    async def _make_full_stack(
-        self, backend: LLMBackend
-    ) -> Tuple[OllamaBridgeServer, HostService]:
-        host_t, consumer_t = create_loopback()
-        host = HostService(host_t, backend, max_payload_size=6)
-        consumer = ConsumerClient(consumer_t, max_payload_size=6, timeout=5.0)
-        await host.start()
-        await consumer.start()
-        self.addAsyncCleanup(host.close)
-        self.addAsyncCleanup(consumer.close)
-        server = await self._serve(consumer, model="bridged")
-        return server, host
-
     async def test_generate_through_ble_pipeline(self):
         server, _ = await self._make_full_stack(
             StaticBackend("The quick brown fox", piece_size=2)
@@ -793,6 +853,218 @@ class EndToEndPipelineTests(ServerTestBase):
 
 
 # --------------------------------------------------------------------------- #
+# Tool calling over the bridge
+# --------------------------------------------------------------------------- #
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search",
+        "description": "search the web",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+    },
+}
+
+PLAINTEXT_CALL_REPLY = 'Let me check.\n<function=search>{"query": "ble"}</function>'
+#: The exact shape reported in the wild: functionary-v1-style plaintext calls.
+FUNCTIONARY_CALL_REPLY = 'function search(query="ble docs")</function>'
+
+
+class _ToolBackend(LLMBackend):
+    """Chat-capable backend that records the params it got and can report
+    structured tool calls through its stream metadata."""
+
+    def __init__(self, reply: str = "hi", meta: dict = None) -> None:
+        self._reply = reply
+        self._meta = meta or {}
+        self.seen_params: Dict[str, object] = {}
+        self.seen_messages: List[dict] = []
+
+    async def generate(self, prompt: str) -> AsyncIterator[str]:
+        for i in range(0, len(self._reply), 3):
+            yield self._reply[i : i + 3]
+
+    def generate_messages(self, messages, **params):
+        self.seen_messages = messages
+        self.seen_params = params
+        reply = self._reply
+
+        async def gen():
+            for i in range(0, len(reply), 3):
+                yield reply[i : i + 3]
+
+        return TokenStream(gen(), dict(self._meta))
+
+
+class ToolCallBridgeTests(ServerTestBase):
+    async def _make_full_stack(self, backend):
+        host_t, consumer_t = create_loopback()
+        host = HostService(host_t, backend, max_payload_size=6)
+        consumer = ConsumerClient(consumer_t, max_payload_size=6, timeout=5.0)
+        await host.start()
+        await consumer.start()
+        self.addAsyncCleanup(host.close)
+        self.addAsyncCleanup(consumer.close)
+        server = await self._serve(consumer, model="bridged")
+        return server, host
+
+    @staticmethod
+    def _chat_body(**extra) -> bytes:
+        body: Dict[str, object] = {
+            "model": "bridged",
+            "messages": [{"role": "user", "content": "find ble docs"}],
+            "tools": [SEARCH_TOOL],
+        }
+        body.update(extra)
+        return json.dumps(body).encode()
+
+    # -- plaintext calls re-framed as tool_calls ------------------------------
+
+    async def test_openai_streaming_re_frames_plaintext_calls(self):
+        # A prompt-only model replying with <function=...> markup: the client
+        # must see structured tool_calls, never the markup as content.
+        server, _ = await self._make_full_stack(
+            StaticBackend(PLAINTEXT_CALL_REPLY, piece_size=3)
+        )
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=self._chat_body(stream=True),
+        )
+        self.assertEqual(resp.status, 200)
+        chunks = resp.sse()
+        content = "".join(
+            c["choices"][0]["delta"].get("content") or "" for c in chunks
+        )
+        self.assertNotIn("<function=", content)
+        self.assertEqual(content.strip(), "Let me check.")
+        deltas = [
+            c["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if c["choices"][0]["delta"].get("tool_calls")
+        ]
+        self.assertEqual(len(deltas), 1)
+        self.assertEqual(deltas[0]["function"]["name"], "search")
+        self.assertEqual(
+            json.loads(deltas[0]["function"]["arguments"]), {"query": "ble"}
+        )
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+
+    async def test_openai_non_streaming_re_frames_plaintext_calls(self):
+        server, _ = await self._make_full_stack(
+            StaticBackend(PLAINTEXT_CALL_REPLY, piece_size=3)
+        )
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=self._chat_body(stream=False),
+        )
+        self.assertEqual(resp.status, 200)
+        choice = resp.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertNotIn("<function=", choice["message"]["content"])
+        calls = choice["message"]["tool_calls"]
+        self.assertEqual(calls[0]["function"]["name"], "search")
+
+    async def test_ollama_chat_reports_tool_calls(self):
+        server, _ = await self._make_full_stack(
+            StaticBackend(PLAINTEXT_CALL_REPLY, piece_size=3)
+        )
+        resp = await _request(
+            server.host, server.port, "POST", "/api/chat", body=self._chat_body()
+        )
+        objects = resp.ndjson()
+        final = objects[-1]
+        self.assertTrue(final["done"])
+        self.assertEqual(final["done_reason"], "tool_calls")
+        calls = final["message"]["tool_calls"]
+        self.assertEqual(calls[0]["function"]["name"], "search")
+        # Ollama models arguments as an object, not a JSON string
+        self.assertEqual(calls[0]["function"]["arguments"], {"query": "ble"})
+        content = "".join(o["message"]["content"] for o in objects)
+        self.assertNotIn("<function=", content)
+
+    async def test_functionary_plaintext_calls_re_framed(self):
+        # ``function name(args)</function>`` (kwargs, not JSON) must arrive as
+        # a structured call too - this is what models emit in the wild.
+        server, _ = await self._make_full_stack(
+            StaticBackend(FUNCTIONARY_CALL_REPLY, piece_size=2)
+        )
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=self._chat_body(stream=True),
+        )
+        chunks = resp.sse()
+        content = "".join(
+            c["choices"][0]["delta"].get("content") or "" for c in chunks
+        )
+        self.assertNotIn("function search", content)
+        deltas = [
+            c["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if c["choices"][0]["delta"].get("tool_calls")
+        ]
+        self.assertEqual(len(deltas), 1)
+        self.assertEqual(deltas[0]["function"]["name"], "search")
+        self.assertEqual(
+            json.loads(deltas[0]["function"]["arguments"]), {"query": "ble docs"}
+        )
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+
+    # -- structured calls reported by the remote backend ----------------------
+
+    async def test_native_tool_calls_from_trailer_reach_client(self):
+        meta = {
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": '{"query": "x"}'},
+                }
+            ],
+            "finish_reason": "tool_calls",
+        }
+        server, _ = await self._make_full_stack(_ToolBackend("Looking...", meta))
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=self._chat_body(stream=True),
+        )
+        chunks = resp.sse()
+        deltas = [
+            c["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if c["choices"][0]["delta"].get("tool_calls")
+        ]
+        self.assertEqual(len(deltas), 1)
+        self.assertEqual(deltas[0]["id"], "call_abc")
+        self.assertEqual(deltas[0]["function"]["name"], "search")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+
+    async def test_tools_forwarded_to_remote_backend(self):
+        backend = _ToolBackend("ok")
+        server, _ = await self._make_full_stack(backend)
+        await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=self._chat_body(stream=False),
+        )
+        # tool definitions crossed the link as native request params
+        self.assertEqual(backend.seen_params.get("tools"), [SEARCH_TOOL])
+        self.assertEqual(backend.seen_messages[0]["content"], "find ble docs")
+
+    # -- no false positives ---------------------------------------------------
+
+    async def test_plain_reply_has_no_tool_calls(self):
+        server, _ = await self._make_full_stack(
+            StaticBackend("Try {curly} braces.", piece_size=3)
+        )
+        resp = await _request(
+            server.host, server.port, "POST", "/v1/chat/completions",
+            body=self._chat_body(stream=False),
+        )
+        choice = resp.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", choice["message"])
+        self.assertEqual(choice["message"]["content"], "Try {curly} braces.")
+
+
+# --------------------------------------------------------------------------- #
 # Lifecycle
 # --------------------------------------------------------------------------- #
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -809,6 +1081,117 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await server.start()
         await server.close()
         await server.close()  # second close must not raise
+
+
+class ConcurrentMetadataTests(ServerTestBase):
+    """Per-request trailer metadata must not leak between concurrent requests.
+
+    ``/v1/chat/completions`` and ``/api/chat`` read tool calls and generation
+    stats off the request's own response stream.  If those were read from
+    shared client state instead, a request that finishes last would hand its
+    metadata to whichever envelope happened to be built next.
+    """
+
+    class _PerPromptBackend(LLMBackend):
+        """Reports a distinct tool call per prompt, with staggered timing.
+
+        ``generate`` receives the *flattened* prompt (this backend has no
+        ``generate_messages``), so the request is identified by its content.
+        """
+
+        async def _run(self, name: str, meta: dict):
+            yield "hi "
+            # "slow" deliberately finishes last, after "fast" is done.
+            await asyncio.sleep(0.15 if name == "slow" else 0.02)
+            yield "there"
+            meta["tool_calls"] = [
+                {
+                    "id": f"call_{name}",
+                    "type": "function",
+                    "function": {
+                        "name": f"tool_{name}",
+                        "arguments": json.dumps({"n": name}),
+                    },
+                }
+            ]
+            meta["finish_reason"] = "tool_calls"
+            meta["timings"] = {"which": name}
+
+        def generate(self, prompt: str) -> TokenStream:
+            name = "slow" if "User: slow" in prompt else "fast"
+            meta: dict = {}
+            return TokenStream(self._run(name, meta), meta)
+
+    async def test_concurrent_tool_calls_stay_isolated(self) -> None:
+        server, _ = await self._make_full_stack(self._PerPromptBackend())
+
+        def _body(prompt: str) -> bytes:
+            return json.dumps(
+                {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": f"tool_{prompt}",
+                                "parameters": {},
+                            },
+                        }
+                    ],
+                }
+            ).encode()
+
+        # "fast" is started first but answered first; "slow" finishes last and
+        # must not overwrite the metadata already reported for "fast".
+        fast, slow = await asyncio.gather(
+            _request(server.host, server.port, "POST", "/api/chat", body=_body("fast")),
+            _request(server.host, server.port, "POST", "/api/chat", body=_body("slow")),
+        )
+        for name, resp in (("fast", fast), ("slow", slow)):
+            message = resp.json()["message"]
+            names = [c["function"]["name"] for c in message.get("tool_calls", [])]
+            self.assertEqual(names, [f"tool_{name}"], f"{name} got {names}")
+            self.assertEqual(resp.json().get("timings"), {"which": name})
+            self.assertEqual(resp.json()["done_reason"], "tool_calls")
+
+    async def test_concurrent_openai_tool_calls_stay_isolated(self) -> None:
+        server, _ = await self._make_full_stack(self._PerPromptBackend())
+
+        def _body(prompt: str) -> bytes:
+            return json.dumps(
+                {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": f"tool_{prompt}",
+                                "parameters": {},
+                            },
+                        }
+                    ],
+                }
+            ).encode()
+
+        fast, slow = await asyncio.gather(
+            _request(
+                server.host, server.port, "POST", "/v1/chat/completions",
+                body=_body("fast"),
+            ),
+            _request(
+                server.host, server.port, "POST", "/v1/chat/completions",
+                body=_body("slow"),
+            ),
+        )
+        for name, resp in (("fast", fast), ("slow", slow)):
+            choice = resp.json()["choices"][0]
+            message = choice["message"]
+            names = [c["function"]["name"] for c in message.get("tool_calls", [])]
+            self.assertEqual(names, [f"tool_{name}"], f"{name} got {names}")
+            self.assertEqual(choice["finish_reason"], "tool_calls")
+            self.assertEqual(resp.json().get("timings"), {"which": name})
 
 
 if __name__ == "__main__":

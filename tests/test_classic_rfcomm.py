@@ -20,13 +20,11 @@ from keytalk.consumer import ConsumerClient
 from keytalk.host import HostService
 from keytalk.modes import (
     CLASSIC_RFCOMM_PROFILE,
-    LEGACY_PROFILE,
     Mode,
     make_classic_rfcomm_profile,
     profile_for_mode,
 )
 from keytalk.protocol import (
-    DEFAULT_ATT_MTU,
     Frame,
     MessageType,
     max_payload_for_mtu,
@@ -335,7 +333,7 @@ class RFCOMMPlatformSkeletonTests(unittest.TestCase):
         import sys
         if sys.platform == "darwin":
             from keytalk.classic.macos import MacOSRFCOMMHostTransport
-            t = MacOSRFCOMMHostTransport.__new__(MacOSRFCOMMHostTransport)
+            MacOSRFCOMMHostTransport.__new__(MacOSRFCOMMHostTransport)
         else:
             with self.assertRaises(RuntimeError):
                 from keytalk.classic.macos import MacOSRFCOMMHostTransport
@@ -345,7 +343,7 @@ class RFCOMMPlatformSkeletonTests(unittest.TestCase):
         import sys
         if sys.platform == "win32":
             from keytalk.classic.windows import WindowsRFCOMMHostTransport
-            t = WindowsRFCOMMHostTransport.__new__(WindowsRFCOMMHostTransport)
+            WindowsRFCOMMHostTransport.__new__(WindowsRFCOMMHostTransport)
         else:
             with self.assertRaises(RuntimeError):
                 from keytalk.classic.windows import WindowsRFCOMMHostTransport

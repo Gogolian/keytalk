@@ -19,7 +19,7 @@ import asyncio
 import struct
 import sys
 import threading
-from typing import Any, Optional
+from typing import Any
 
 from .channel import RFCOMMStreamTransport
 from ..transport import TransportClosed

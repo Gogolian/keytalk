@@ -13,17 +13,14 @@ from keytalk.modes import (
     negotiate_mode,
     mode_id_for,
     mode_for_id,
-    profile_for_mode,
 )
 from keytalk.protocol import (
-    Frame,
-    Flags,
     MessageType,
     ProtocolError,
     encode_select_payload,
     decode_select_payload,
 )
-from keytalk.transport import InMemoryTransport, create_loopback
+from keytalk.transport import create_loopback
 
 
 # ---------------------------------------------------------------------------

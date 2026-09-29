@@ -42,7 +42,7 @@ async def discover_hosts(timeout: float = 5.0):
     lets the user pick which host to connect to.
     """
 
-    bleak = _import_bleak()
+    _import_bleak()
     from bleak import BleakScanner
 
     devices = await BleakScanner.discover(

@@ -38,3 +38,20 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 keytalk = ["py.typed"]
+
+[dependency-groups]
+dev = ["pyflakes>=3.0"]
+
+# ---------------------------------------------------------------------------
+# Development
+#
+# The core library and the whole test-suite have no runtime dependencies.
+#
+#   python3 -m unittest discover -s tests -v   # full test run
+#   python3 -m pyflakes src/keytalk tests tools  # lint (no config file support,
+#                                               # so it runs with defaults)
+#
+# There is deliberately no type-checker config: the project is pure asyncio
+# with a handful of structural protocols, and an unverified ``--strict`` run
+# would be noise rather than signal.
+# ---------------------------------------------------------------------------

@@ -11,7 +11,6 @@ import sys
 from typing import Optional
 
 from .channel import L2CAPStreamTransport
-from ...transport import TransportClosed
 
 __all__ = ["LinuxL2CAPHostTransport", "LinuxL2CAPConsumerTransport"]
 

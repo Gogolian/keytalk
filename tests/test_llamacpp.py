@@ -70,6 +70,29 @@ MODELS_BODY = {
               "owned_by": "llamacpp"}],
 }
 
+TOOLCALL_STREAM = (
+    _sse({"choices": [{"delta": {"role": "assistant", "content": None},
+                       "finish_reason": None, "index": 0}],
+          "created": 1, "id": "chatcmpl-x", "model": "m",
+          "object": "chat.completion.chunk"})
+    + _sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "search", "arguments": "{\"qu"}}]},
+                "finish_reason": None, "index": 0}],
+            "created": 1, "id": "chatcmpl-x", "model": "m",
+            "object": "chat.completion.chunk"})
+    + _sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "ery\": \"x\"}"}}]},
+                "finish_reason": None, "index": 0}],
+            "created": 1, "id": "chatcmpl-x", "model": "m",
+            "object": "chat.completion.chunk"})
+    + _sse({"choices": [{"delta": {}, "finish_reason": "tool_calls", "index": 0}],
+            "created": 1, "id": "chatcmpl-x", "model": "m",
+            "object": "chat.completion.chunk",
+            "timings": {"prompt_n": 9, "predicted_n": 4}})
+    + "data: [DONE]\n\n"
+)
+
 
 class _Handler(BaseHTTPRequestHandler):
     """Serves canned llama.cpp responses and records what was requested."""
@@ -191,6 +214,68 @@ class ChatCompletionsTests(LlamaCppTestBase):
         backend = LlamaCppBackend(host=self.host)
         with self.assertRaises(LlamaCppError):
             [p async for p in backend.generate_messages([{"role": "user", "content": "x"}])]
+
+
+class ToolCallStreamTests(LlamaCppTestBase):
+    TOOLS = [
+        {"type": "function",
+         "function": {"name": "search", "parameters": {"type": "object"}}}
+    ]
+
+    async def test_tool_call_deltas_merged_into_metadata(self):
+        self.route("/v1/chat/completions", TOOLCALL_STREAM)
+        backend = LlamaCppBackend(host=self.host)
+        stream = backend.generate_messages(
+            [{"role": "user", "content": "find x"}], tools=self.TOOLS
+        )
+        pieces = [p async for p in stream]
+        self.assertEqual(pieces, [])  # tool calls never leak into the text
+        self.assertEqual(stream.finish_reason, "tool_calls")
+        self.assertEqual(len(stream.tool_calls), 1)
+        call = stream.tool_calls[0]
+        self.assertEqual(call["id"], "call_1")
+        self.assertEqual(call["type"], "function")
+        self.assertEqual(call["function"]["name"], "search")
+        # fragmented argument deltas were concatenated
+        self.assertEqual(call["function"]["arguments"], '{"query": "x"}')
+        self.assertEqual(stream.timings["prompt_n"], 9)
+        # tools were forwarded to llama.cpp as a native request field
+        request = json.loads(_Handler.requests[0][2])
+        self.assertEqual(request["tools"], self.TOOLS)
+
+    async def test_no_tool_calls_reports_none(self):
+        self.route("/v1/chat/completions", CHAT_STREAM)
+        backend = LlamaCppBackend(host=self.host)
+        stream = backend.generate_messages([{"role": "user", "content": "x"}])
+        [p async for p in stream]
+        self.assertIsNone(stream.tool_calls)
+        self.assertEqual(stream.finish_reason, "stop")
+
+
+class ChatFallbackTests(LlamaCppTestBase):
+    async def test_404_on_completions_falls_back_to_chat(self):
+        """OpenAI-only servers (mlx_vlm.server) 404 the native route."""
+
+        self.route("/v1/chat/completions", CHAT_STREAM)
+        backend = LlamaCppBackend(model="models/qwen-mlx", host=self.host)
+        stream = backend.generate("hi")
+        self.assertEqual("".join([p async for p in stream]), "World")
+        # first probe hit the native route, retry went through chat
+        self.assertEqual(_Handler.requests[0][1], "/completions")
+        method, path, body = _Handler.requests[1]
+        self.assertEqual((method, path), ("POST", "/v1/chat/completions"))
+        request = json.loads(body)
+        self.assertEqual(request["messages"], [{"role": "user", "content": "hi"}])
+        self.assertEqual(request["model"], "models/qwen-mlx")
+
+    async def test_non_404_still_raises(self):
+        self.route("/completions", json.dumps({"error": "boom"}),
+                   status=500, ctype="application/json")
+        backend = LlamaCppBackend(host=self.host)
+        with self.assertRaises(LlamaCppError) as ctx:
+            [p async for p in backend.generate("hi")]
+        self.assertEqual(len(_Handler.requests), 1)  # no fallback on 500
+        self.assertIn("boom", str(ctx.exception))
 
 
 class ListModelsTests(LlamaCppTestBase):

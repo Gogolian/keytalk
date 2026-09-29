@@ -16,7 +16,13 @@ import os
 import ssl
 import urllib.error
 import urllib.request
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Dict, List, Optional
+
+from .toolcalls import (
+    render_tool_result,
+    tool_calls_to_prompt_lines,
+    tools_to_prompt_section,
+)
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -28,6 +34,183 @@ def _ssl_context() -> ssl.SSLContext:
                 ctx.load_verify_locations(cafile)
                 break
     return ctx
+
+
+# ---------------------------------------------------------------------------
+# Shared HTTP plumbing
+#
+# Every backend below is the same shape: POST a JSON body to a local (or
+# remote) inference server, read a line-at-a-time text stream, and pull the
+# text fragment out of each line.  ``urllib`` is blocking, so the request
+# runs in a worker thread and each line is handed back to the event loop
+# through a queue.  Only the URL, the body and the per-line parser differ
+# between backends, so those are the only things callers supply.
+# ---------------------------------------------------------------------------
+
+
+def _error_factory(cls: type) -> Callable[..., Exception]:
+    """Build an error factory raising ``cls``, tolerating an HTTP status code.
+
+    ``LlamaCppError`` takes a ``code``; the others do not, so the code is
+    dropped rather than every backend having to special-case it.
+    """
+
+    def make(message: str, code: Optional[int] = None) -> Exception:
+        if code is None:
+            return cls(message)
+        return cls(message, code=code)  # type: ignore[call-arg]
+
+    return make
+
+
+async def _stream_lines(
+    url: str,
+    body: Optional[bytes],
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float,
+    error: Callable[..., Exception],
+    context: Optional[ssl.SSLContext] = None,
+) -> AsyncIterator[bytes]:
+    """Yield raw response lines from a streaming HTTP endpoint.
+
+    Raises ``error(...)`` if the endpoint is unreachable or returns an HTTP
+    error status.  The connection is always closed and the worker thread is
+    always awaited, even when the consumer stops early.
+    """
+
+    loop = asyncio.get_running_loop()
+    queue: "asyncio.Queue[object]" = asyncio.Queue()
+    done = object()
+
+    def worker() -> None:
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers=headers or {"Content-Type": "application/json"},
+            method="POST" if body is not None else "GET",
+        )
+        try:
+            kwargs = {"timeout": timeout}
+            if context is not None:
+                kwargs["context"] = context
+            with urllib.request.urlopen(request, **kwargs) as response:
+                for raw_line in response:
+                    loop.call_soon_threadsafe(queue.put_nowait, raw_line)
+        except urllib.error.HTTPError as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, error(_http_error_text(exc), exc.code))
+        except urllib.error.URLError as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, error(f"cannot reach {url}: {exc}"))
+        except Exception as exc:  # pragma: no cover - defensive
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, done)
+
+    worker_future = loop.run_in_executor(None, worker)
+    try:
+        while True:
+            item = await queue.get()
+            if item is done:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield bytes(item)
+    finally:
+        await worker_future
+
+
+async def _json_get(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float,
+    error: Callable[..., Exception],
+    context: Optional[ssl.SSLContext] = None,
+) -> object:
+    """GET a JSON document, raising ``error(...)`` on any failure.
+
+    The result is returned untyped so each backend can pick its own shape
+    (``/v1/models``, Ollama's ``/api/tags``, ...).
+    """
+
+    loop = asyncio.get_running_loop()
+
+    def worker() -> object:
+        request = urllib.request.Request(url, method="GET", headers=headers or {})
+        try:
+            kwargs = {"timeout": timeout}
+            if context is not None:
+                kwargs["context"] = context
+            with urllib.request.urlopen(request, **kwargs) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return error(_http_error_text(exc), exc.code)
+        except urllib.error.URLError as exc:
+            return error(f"cannot reach {url}: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive
+            return exc
+
+    result = await loop.run_in_executor(None, worker)
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+def _names_from(payload: object, *keys: str) -> List[str]:
+    """Pull model names out of a ``{"models": ...}``/``{"data": ...}`` listing.
+
+    Servers disagree on the field name (``id``, ``name`` or ``model``) and on
+    the envelope key, so both are tried before giving up.
+    """
+
+    if not isinstance(payload, dict):
+        return []
+    for key in keys:
+        entries = payload.get(key)
+        if not isinstance(entries, list):
+            continue
+        names: List[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get("id") or entry.get("name") or entry.get("model")
+            if value:
+                names.append(str(value))
+        if names:
+            return names
+    return []
+
+
+def _parse_openai_sse_line(line: bytes, error: type) -> Optional[str]:
+    """Extract the text fragment from an OpenAI-compatible SSE line.
+
+    Shared by the LM Studio and OpenRouter backends: both frame every chunk as
+    ``data: {json}`` with the assistant text in ``choices[0].delta.content``.
+    Comment/keep-alive lines and the ``[DONE]`` terminator yield ``None``; an
+    ``error`` member raises the backend's own error type.
+    """
+
+    line = line.strip()
+    if not line or line == b"data: [DONE]" or line.startswith(b":"):
+        return None
+    if line.startswith(b"data: "):
+        line = line[6:]
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if "error" in obj:
+        raise error(str(obj["error"]))
+    choices = obj.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+        if content:
+            return content
+    return None
+
 
 __all__ = [
     "LLMBackend",
@@ -159,12 +342,12 @@ def parse_ollama_line(line: bytes) -> Optional[str]:
 class OllamaBackend(LLMBackend):
     """Stream completions from a local Ollama server.
 
-    The blocking HTTP request runs in a worker thread; decoded lines are pushed
-    onto an :class:`asyncio.Queue` and yielded as they arrive so the host can
-    forward tokens to the consumer without waiting for the full completion.
+    Ollama's ``/api/generate`` emits one JSON object per line (not SSE), so the
+    line parser is :func:`parse_ollama_line`; the streaming plumbing is shared
+    with the other HTTP backends.
     """
 
-    _DONE = object()
+    _ERROR = staticmethod(_error_factory(OllamaError))
 
     def __init__(
         self,
@@ -181,87 +364,33 @@ class OllamaBackend(LLMBackend):
 
     async def generate(self, prompt: str) -> AsyncIterator[str]:
         logger.info("Starting Ollama generation for model=%r, prompt=%r", self._model, prompt[:100])
-        loop = asyncio.get_running_loop()
-        queue: "asyncio.Queue[object]" = asyncio.Queue()
-
-        def worker() -> None:
-            url = f"{self._host}/api/generate"
-            request_body: dict[str, object] = {
-                "model": self._model,
-                "prompt": prompt,
-                "stream": True,
-            }
-            if self._num_ctx is not None:
-                # Load the model with a larger context window so big agent
-                # prompts don't overflow Ollama's default (which can be as
-                # small as 4096 tokens and yields an n_keep >= n_ctx error).
-                request_body["options"] = {"num_ctx": self._num_ctx}
-            body = json.dumps(request_body).encode("utf-8")
-            request = urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"}
-            )
-            try:
-                logger.debug("Sending request to Ollama at %s", url)
-                with urllib.request.urlopen(
-                    request, timeout=self._timeout
-                ) as response:
-                    logger.info("Connected to Ollama, streaming response")
-                    for raw_line in response:
-                        loop.call_soon_threadsafe(queue.put_nowait, raw_line)
-            except urllib.error.URLError as exc:
-                logger.error("Failed to reach Ollama: %s", exc)
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, OllamaError(f"cannot reach Ollama: {exc}")
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.error("Unexpected error in Ollama worker: %s", exc)
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                logger.debug("Ollama worker finished")
-                loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
-
-        worker_future = loop.run_in_executor(None, worker)
-        try:
-            while True:
-                item = await queue.get()
-                if item is self._DONE:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                assert isinstance(item, (bytes, bytearray))
-                fragment = parse_ollama_line(bytes(item))
-                if fragment:
-                    yield fragment
-        finally:
-            await worker_future
+        request_body: dict[str, object] = {
+            "model": self._model,
+            "prompt": prompt,
+            "stream": True,
+        }
+        if self._num_ctx is not None:
+            # Load the model with a larger context window so big agent
+            # prompts don't overflow Ollama's default (which can be as
+            # small as 4096 tokens and yields an n_keep >= n_ctx error).
+            request_body["options"] = {"num_ctx": self._num_ctx}
+        async for line in _stream_lines(
+            f"{self._host}/api/generate",
+            json.dumps(request_body).encode("utf-8"),
+            timeout=self._timeout,
+            error=self._ERROR,
+        ):
+            fragment = parse_ollama_line(line)
+            if fragment:
+                yield fragment
 
     async def list_models(self) -> list[str]:
         """Return the model names reported by Ollama's ``/api/tags`` endpoint."""
 
-        loop = asyncio.get_running_loop()
-
-        def worker() -> object:
-            url = f"{self._host}/api/tags"
-            request = urllib.request.Request(url, method="GET")
-            try:
-                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except urllib.error.URLError as exc:
-                return OllamaError(f"cannot reach Ollama: {exc}")
-            except Exception as exc:  # pragma: no cover - defensive
-                return exc
-
-        result = await loop.run_in_executor(None, worker)
-        if isinstance(result, Exception):
-            raise result
-        models = result.get("models", []) if isinstance(result, dict) else []
-        names: list[str] = []
-        for entry in models:
-            if isinstance(entry, dict):
-                name = entry.get("name") or entry.get("model")
-                if name:
-                    names.append(str(name))
-        return names
+        payload = await _json_get(
+            f"{self._host}/api/tags", timeout=self._timeout, error=self._ERROR
+        )
+        return _names_from(payload, "models")
 
 
 class LMStudioError(Exception):
@@ -269,15 +398,14 @@ class LMStudioError(Exception):
 
 
 class LMStudioBackend(LLMBackend):
-    """Stream completions from a local LM Studio server using OpenAI-compatible API.
+    """Stream completions from a local LM Studio server using its OpenAI-compatible API.
 
-    LM Studio provides an OpenAI-compatible endpoint at /v1/chat/completions.
-    The blocking HTTP request runs in a worker thread; decoded lines are pushed
-    onto an :class:`asyncio.Queue` and yielded as they arrive so the host can
-    forward tokens to the consumer without waiting for the full completion.
+    LM Studio provides an OpenAI-compatible endpoint at ``/v1/chat/completions``
+    that frames every chunk as SSE (``data: {json}``), with the text in
+    ``choices[0].delta.content``.
     """
 
-    _DONE = object()
+    _ERROR = staticmethod(_error_factory(LMStudioError))
 
     def __init__(
         self,
@@ -292,115 +420,29 @@ class LMStudioBackend(LLMBackend):
 
     async def generate(self, prompt: str) -> AsyncIterator[str]:
         logger.info("Starting LM Studio generation for model=%r, prompt=%r", self._model, prompt[:100])
-        loop = asyncio.get_running_loop()
-        queue: "asyncio.Queue[object]" = asyncio.Queue()
-
-        def worker() -> None:
-            url = f"{self._host}/v1/chat/completions"
-            body = json.dumps({
-                "model": self._model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": True,
-                "temperature": 0.7,
-            }).encode("utf-8")
-            request = urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"}
-            )
-            try:
-                logger.debug("Sending request to LM Studio at %s", url)
-                with urllib.request.urlopen(
-                    request, timeout=self._timeout
-                ) as response:
-                    logger.info("Connected to LM Studio, streaming response")
-                    for raw_line in response:
-                        loop.call_soon_threadsafe(queue.put_nowait, raw_line)
-            except urllib.error.URLError as exc:
-                logger.error("Failed to reach LM Studio: %s", exc)
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, LMStudioError(f"cannot reach LM Studio: {exc}")
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.error("Unexpected error in LM Studio worker: %s", exc)
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                logger.debug("LM Studio worker finished")
-                loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
-
-        worker_future = loop.run_in_executor(None, worker)
-        try:
-            while True:
-                item = await queue.get()
-                if item is self._DONE:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                assert isinstance(item, (bytes, bytearray))
-                fragment = self._parse_openai_sse_line(bytes(item))
-                if fragment:
-                    yield fragment
-        finally:
-            await worker_future
-
-    def _parse_openai_sse_line(self, line: bytes) -> Optional[str]:
-        """Extract text fragment from OpenAI-compatible SSE stream.
-
-        LM Studio uses Server-Sent Events format:
-        data: {"choices":[{"delta":{"content":"text"}}]}
-        """
-        line = line.strip()
-        if not line or line == b"data: [DONE]":
-            return None
-        
-        # SSE lines start with "data: "
-        if line.startswith(b"data: "):
-            line = line[6:]  # Remove "data: " prefix
-        
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            # Skip malformed lines (empty data, etc.)
-            return None
-        
-        if "error" in obj:
-            raise LMStudioError(str(obj["error"]))
-        
-        # Extract content from OpenAI-style streaming response
-        choices = obj.get("choices", [])
-        if choices and len(choices) > 0:
-            delta = choices[0].get("delta", {})
-            content = delta.get("content")
-            if content:
-                return content
-        
-        return None
+        body = json.dumps({
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "temperature": 0.7,
+        }).encode("utf-8")
+        async for line in _stream_lines(
+            f"{self._host}/v1/chat/completions",
+            body,
+            timeout=self._timeout,
+            error=self._ERROR,
+        ):
+            fragment = _parse_openai_sse_line(line, LMStudioError)
+            if fragment:
+                yield fragment
 
     async def list_models(self) -> list[str]:
         """Return the model ids reported by LM Studio's ``/v1/models`` endpoint."""
 
-        loop = asyncio.get_running_loop()
-
-        def worker() -> object:
-            url = f"{self._host}/v1/models"
-            request = urllib.request.Request(url, method="GET")
-            try:
-                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except urllib.error.URLError as exc:
-                return LMStudioError(f"cannot reach LM Studio: {exc}")
-            except Exception as exc:  # pragma: no cover - defensive
-                return exc
-
-        result = await loop.run_in_executor(None, worker)
-        if isinstance(result, Exception):
-            raise result
-        data = result.get("data", []) if isinstance(result, dict) else []
-        names: list[str] = []
-        for entry in data:
-            if isinstance(entry, dict):
-                name = entry.get("id")
-                if name:
-                    names.append(str(name))
-        return names
+        payload = await _json_get(
+            f"{self._host}/v1/models", timeout=self._timeout, error=self._ERROR
+        )
+        return _names_from(payload, "data")
 
 
 class OpenRouterError(Exception):
@@ -411,12 +453,12 @@ class OpenRouterBackend(LLMBackend):
     """Stream completions from OpenRouter using its OpenAI-compatible API.
 
     OpenRouter is a hosted gateway to many models (OpenAI, Anthropic, Google,
-    Meta, …).  Requires an API key passed via ``api_key`` or the
+    Meta, ...).  Requires an API key passed via ``api_key`` or the
     ``OPENROUTER_API_KEY`` environment variable.  The default model can be
     overridden per-request via ``model``.
     """
 
-    _DONE = object()
+    _ERROR = staticmethod(_error_factory(OpenRouterError))
     _HOST = "https://openrouter.ai"
 
     def __init__(
@@ -430,7 +472,7 @@ class OpenRouterBackend(LLMBackend):
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._timeout = timeout
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self) -> Dict[str, str]:
         if not self._api_key:
             raise OpenRouterError(
                 "OpenRouter API key not set; pass --openrouter-key or set OPENROUTER_API_KEY"
@@ -442,109 +484,38 @@ class OpenRouterBackend(LLMBackend):
 
     async def generate(self, prompt: str) -> AsyncIterator[str]:
         logger.info("Starting OpenRouter generation for model=%r, prompt=%r", self._model, prompt[:100])
-        loop = asyncio.get_running_loop()
-        queue: "asyncio.Queue[object]" = asyncio.Queue()
-
-        def worker() -> None:
-            url = f"{self._HOST}/api/v1/chat/completions"
-            body = json.dumps({
-                "model": self._model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": True,
-            }).encode("utf-8")
-            try:
-                headers = self._headers()
-            except OpenRouterError as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-                loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
-                return
-            request = urllib.request.Request(url, data=body, headers=headers)
-            try:
-                logger.debug("Sending request to OpenRouter at %s", url)
-                with urllib.request.urlopen(request, timeout=self._timeout, context=_ssl_context()) as response:
-                    logger.info("Connected to OpenRouter, streaming response")
-                    for raw_line in response:
-                        loop.call_soon_threadsafe(queue.put_nowait, raw_line)
-            except urllib.error.URLError as exc:
-                logger.error("Failed to reach OpenRouter: %s", exc)
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, OpenRouterError(f"cannot reach OpenRouter: {exc}")
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.error("Unexpected error in OpenRouter worker: %s", exc)
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                logger.debug("OpenRouter worker finished")
-                loop.call_soon_threadsafe(queue.put_nowait, self._DONE)
-
-        worker_future = loop.run_in_executor(None, worker)
-        try:
-            while True:
-                item = await queue.get()
-                if item is self._DONE:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                assert isinstance(item, (bytes, bytearray))
-                fragment = self._parse_sse_line(bytes(item))
-                if fragment:
-                    yield fragment
-        finally:
-            await worker_future
-
-    def _parse_sse_line(self, line: bytes) -> Optional[str]:
-        """Extract text fragment from an OpenAI-compatible SSE line."""
-        line = line.strip()
-        if not line or line == b"data: [DONE]":
-            return None
-        if line.startswith(b"data: "):
-            line = line[6:]
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-        if "error" in obj:
-            raise OpenRouterError(str(obj["error"]))
-        choices = obj.get("choices", [])
-        if choices:
-            delta = choices[0].get("delta", {})
-            content = delta.get("content")
-            if content:
-                return content
-        return None
+        # Fail fast, before spending a connection, when no key is configured.
+        headers = self._headers()
+        body = json.dumps({
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        }).encode("utf-8")
+        async for line in _stream_lines(
+            f"{self._HOST}/api/v1/chat/completions",
+            body,
+            headers=headers,
+            timeout=self._timeout,
+            error=self._ERROR,
+            context=_ssl_context(),
+        ):
+            fragment = _parse_openai_sse_line(line, OpenRouterError)
+            if fragment:
+                yield fragment
 
     async def list_models(self) -> list[str]:
         """Return model ids from OpenRouter's ``/api/v1/models`` endpoint."""
         if not self._api_key:
             return []
-        loop = asyncio.get_running_loop()
+        payload = await _json_get(
+            f"{self._HOST}/api/v1/models",
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=self._timeout,
+            error=self._ERROR,
+            context=_ssl_context(),
+        )
+        return sorted(_names_from(payload, "data"))
 
-        def worker() -> object:
-            url = f"{self._HOST}/api/v1/models"
-            request = urllib.request.Request(
-                url,
-                method="GET",
-                headers={"Authorization": f"Bearer {self._api_key}"},
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self._timeout, context=_ssl_context()) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except urllib.error.URLError as exc:
-                return OpenRouterError(f"cannot reach OpenRouter: {exc}")
-            except Exception as exc:  # pragma: no cover - defensive
-                return exc
-
-        result = await loop.run_in_executor(None, worker)
-        if isinstance(result, Exception):
-            raise result
-        data = result.get("data", []) if isinstance(result, dict) else []
-        names: list[str] = []
-        for entry in data:
-            if isinstance(entry, dict):
-                name = entry.get("id")
-                if name:
-                    names.append(str(name))
-        return sorted(names)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -578,13 +549,32 @@ class TokenStream:
         value = self._meta.get("timings")
         return value if isinstance(value, dict) else None
 
+    @property
+    def tool_calls(self) -> Optional[list]:
+        """Structured tool calls reported by the server, once available."""
 
-def messages_to_prompt(messages: list) -> str:
+        value = self._meta.get("tool_calls")
+        return value if isinstance(value, list) and value else None
+
+    @property
+    def finish_reason(self) -> Optional[str]:
+        """Why generation stopped ("stop", "tool_calls", ...), once available."""
+
+        value = self._meta.get("finish_reason")
+        return value if isinstance(value, str) else None
+
+
+def messages_to_prompt(messages: list, tools: Optional[list] = None) -> str:
     """Render chat messages into a plain transcript for prompt-only backends.
 
     Backends with native chat support (e.g. :class:`LlamaCppBackend`) pass the
     structured messages straight through so the model's own chat template is
     used; this is only the fallback for backends that accept a single prompt.
+
+    Tool-calling turns survive the flattening: assistant ``tool_calls`` and
+    ``role: "tool"`` results are rendered as transcript lines, and ``tools``
+    (when given) adds an instruction block teaching the plaintext call syntax
+    :func:`keytalk.toolcalls.parse_text_tool_calls` can read back.
     """
 
     systems: list = []
@@ -601,12 +591,20 @@ def messages_to_prompt(messages: list) -> str:
             if content:
                 systems.append(content)
         elif role == "assistant":
-            turns.append(f"Assistant: {content}")
-        else:  # treat anything else (user/tool/...) as a user turn
+            calls = tool_calls_to_prompt_lines(message.get("tool_calls") or [])
+            if content or not calls:
+                turns.append(f"Assistant: {content}")
+            for line in calls:
+                turns.append(f"Assistant: {line}")
+        elif role == "tool":
+            turns.append(render_tool_result(message))
+        else:  # treat anything else (user/...) as a user turn
             turns.append(f"User: {content}")
     parts: list = []
     if systems:
         parts.append("\n".join(systems))
+    if tools:
+        parts.append(tools_to_prompt_section(tools))
     parts.extend(turns)
     body = "\n".join(parts)
     if body:
@@ -615,7 +613,15 @@ def messages_to_prompt(messages: list) -> str:
 
 
 class LlamaCppError(Exception):
-    """Raised when the llama.cpp server cannot be reached or errors out."""
+    """Raised when the llama.cpp server cannot be reached or errors out.
+
+    ``code`` carries the HTTP status when the failure came from an HTTP
+    error response (``None`` for connection problems and in-stream errors).
+    """
+
+    def __init__(self, message: str, *, code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class LlamaCppBackend(LLMBackend):
@@ -636,6 +642,8 @@ class LlamaCppBackend(LLMBackend):
     ``reasoning_content`` deltas (deepseek thinking format) are skipped; the
     content stream carries assistant output only.
     """
+
+    _ERROR = staticmethod(_error_factory(LlamaCppError))
 
     def __init__(
         self,
@@ -659,15 +667,46 @@ class LlamaCppBackend(LLMBackend):
         if self._n_predict:
             body["n_predict"] = self._n_predict
         meta: dict = {}
-        return TokenStream(self._run(body, "/completions", meta, chat=False), meta)
+        return TokenStream(self._generate_with_fallback(body, prompt, meta), meta)
+
+    async def _generate_with_fallback(
+        self, body: dict, prompt: str, meta: dict
+    ) -> AsyncIterator[str]:
+        """Stream a completion, falling back to the chat endpoint on 404.
+
+        OpenAI-only servers that speak ``llama-server``'s API subset but not
+        its native route (e.g. ``mlx_vlm.server``) answer ``404`` on
+        ``/completions``; wrap the prompt as a single user message and retry
+        via ``/v1/chat/completions`` instead of failing the request.
+        """
+
+        try:
+            async for text in self._run(body, "/completions", meta, chat=False):
+                yield text
+            return
+        except LlamaCppError as exc:
+            if exc.code != 404:
+                raise
+        chat_body: dict = {
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        }
+        if self._model:
+            chat_body["model"] = self._model
+        if self._n_predict:
+            chat_body["max_tokens"] = self._n_predict
+        async for text in self._run(chat_body, "/v1/chat/completions", meta, chat=True):
+            yield text
 
     def generate_messages(self, messages: list, **params) -> TokenStream:
         """Stream a chat completion from ``/v1/chat/completions``.
 
         ``messages`` are passed through as-is so llama.cpp's Jinja chat
         template (including ``preserve_thinking`` etc.) does the rendering.
-        Extra keyword arguments (``temperature``, ``max_tokens``, ...) are
-        merged into the request body.
+        Extra keyword arguments (``temperature``, ``max_tokens``, ``tools``,
+        ``tool_choice``, ...) are merged into the request body untouched, so
+        tool-calling reaches the model natively.  Any tool calls the model
+        makes are accumulated on the stream's ``tool_calls`` metadata.
         """
 
         body: dict = {"messages": list(messages), "stream": True}
@@ -678,91 +717,34 @@ class LlamaCppBackend(LLMBackend):
         return TokenStream(self._run(body, "/v1/chat/completions", meta, chat=True), meta)
 
     async def list_models(self) -> list[str]:
-        loop = asyncio.get_running_loop()
-
-        def worker() -> object:
-            url = f"{self._host}/v1/models"
-            request = urllib.request.Request(url, method="GET")
-            try:
-                with urllib.request.urlopen(request, timeout=self._timeout) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                return LlamaCppError(_http_error_text(exc))
-            except urllib.error.URLError as exc:
-                return LlamaCppError(f"cannot reach llama-server: {exc}")
-            except Exception as exc:  # noqa: BLE001 - defensive
-                return exc
-
-        result = await loop.run_in_executor(None, worker)
-        if isinstance(result, Exception):
-            raise result
         # The endpoint reports both an OAI-style "data" and an Ollama-style
         # "models" array; prefer "data", fall back to "models".
-        names = [
-            str(entry.get("id"))
-            for entry in result.get("data", [])
-            if isinstance(entry, dict) and entry.get("id")
-        ]
-        if not names:
-            names = [
-                str(entry.get("name"))
-                for entry in result.get("models", [])
-                if isinstance(entry, dict) and entry.get("name")
-            ]
-        return names
+        payload = await _json_get(
+            f"{self._host}/v1/models", timeout=self._timeout, error=self._ERROR
+        )
+        return _names_from(payload, "data", "models")
 
     # -- internals ------------------------------------------------------------
 
     async def _run(self, body: dict, path: str, meta: dict, *, chat: bool) -> AsyncIterator[str]:
-        loop = asyncio.get_running_loop()
-        queue: "asyncio.Queue[object]" = asyncio.Queue()
-        done = object()
-        url = f"{self._host}{path}"
-        payload = json.dumps(body).encode("utf-8")
-
-        def worker() -> None:
-            request = urllib.request.Request(
-                url, data=payload, headers={"Content-Type": "application/json"}
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                    for raw_line in response:
-                        loop.call_soon_threadsafe(queue.put_nowait, raw_line)
-            except urllib.error.HTTPError as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, LlamaCppError(_http_error_text(exc))
-                )
-            except urllib.error.URLError as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    LlamaCppError(f"cannot reach llama-server: {exc}"),
-                )
-            except Exception as exc:  # noqa: BLE001 - defensive
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, done)
-
-        worker_future = loop.run_in_executor(None, worker)
-        try:
-            while True:
-                item = await queue.get()
-                if item is done:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                chunk = _parse_sse_json(bytes(item))
-                if chunk is None:
-                    continue
-                if isinstance(chunk.get("error"), (dict, str)):
-                    raise LlamaCppError(str(chunk["error"]))
-                timings = chunk.get("timings")
-                if isinstance(timings, dict):
-                    meta["timings"] = timings
-                text = _chunk_content(chunk, chat=chat)
-                if text:
-                    yield text
-        finally:
-            await worker_future
+        async for line in _stream_lines(
+            f"{self._host}{path}",
+            json.dumps(body).encode("utf-8"),
+            timeout=self._timeout,
+            error=self._ERROR,
+        ):
+            chunk = _parse_sse_json(line)
+            if chunk is None:
+                continue
+            if isinstance(chunk.get("error"), (dict, str)):
+                raise LlamaCppError(str(chunk["error"]))
+            timings = chunk.get("timings")
+            if isinstance(timings, dict):
+                meta["timings"] = timings
+            _collect_tool_call(chunk, meta)
+            text = _chunk_content(chunk, chat=chat)
+            if text:
+                yield text
 
 
 def _http_error_text(exc: "urllib.error.HTTPError") -> str:
@@ -803,3 +785,51 @@ def _chunk_content(chunk: dict, *, chat: bool) -> Optional[str]:
     else:
         content = chunk.get("content")
     return content if isinstance(content, str) and content else None
+
+
+def _collect_tool_call(chunk: dict, meta: dict) -> None:
+    """Accumulate streamed tool-call deltas into ``meta["tool_calls"]``.
+
+    OpenAI-style chunks carry ``choices[0].delta.tool_calls`` as fragments
+    (``{"index": 0, "id": ..., "function": {"name": ..., "arguments": ...}}``)
+    where later fragments append to the same call's ``arguments`` string;
+    ``finish_reason: "tool_calls"`` marks a tool-calling turn.  Fragments are
+    merged by ``index`` so the metadata ends up with one complete call per
+    model invocation, ready to be forwarded as a message trailer.
+    """
+
+    choices = chunk.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return
+    choice = choices[0]
+    finish = choice.get("finish_reason")
+    if isinstance(finish, str) and finish:
+        meta["finish_reason"] = finish
+    delta = choice.get("delta") or {}
+    fragments = delta.get("tool_calls")
+    if isinstance(fragments, dict):  # some servers send a single object
+        fragments = [fragments]
+    if not isinstance(fragments, list):
+        return
+    calls: list = meta.setdefault("tool_calls", [])
+    for fragment in fragments:
+        if not isinstance(fragment, dict):
+            continue
+        index = fragment.get("index")
+        if not isinstance(index, int):
+            index = len(calls) - 1 if calls else 0
+        while len(calls) <= index:
+            calls.append({})
+        call = calls[index]
+        if fragment.get("id"):
+            call["id"] = str(fragment["id"])
+        if fragment.get("type"):
+            call["type"] = str(fragment["type"])
+        function = fragment.get("function")
+        if isinstance(function, dict):
+            target = call.setdefault("function", {})
+            if function.get("name"):
+                target["name"] = str(function["name"])
+            arguments = function.get("arguments")
+            if isinstance(arguments, str) and arguments:
+                target["arguments"] = target.get("arguments", "") + arguments

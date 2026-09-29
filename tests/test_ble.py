@@ -32,26 +32,22 @@ class UuidTests(unittest.TestCase):
 
 class OptionalDependencyTests(unittest.TestCase):
     def test_central_reports_missing_bleak(self):
+        import importlib.util
+
         from keytalk.ble import central
 
-        try:
-            import bleak  # noqa: F401
-
+        if importlib.util.find_spec("bleak") is not None:
             self.skipTest("bleak is installed; cannot test missing-dep path")
-        except ImportError:
-            pass
         with self.assertRaises(RuntimeError):
             central._import_bleak()
 
     def test_peripheral_reports_missing_bless(self):
+        import importlib.util
+
         from keytalk.ble import peripheral
 
-        try:
-            import bless  # noqa: F401
-
+        if importlib.util.find_spec("bless") is not None:
             self.skipTest("bless is installed; cannot test missing-dep path")
-        except ImportError:
-            pass
         with self.assertRaises(RuntimeError):
             peripheral._import_bless()
 
